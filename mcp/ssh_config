@@ -1,0 +1,29 @@
+# remote-ws MCP 使用的服务器列表（只被 MCP 通过 ssh -F 读取，不影响 ~/.ssh/config）。
+# 每台机器一个 Host srv-<名字> 块，只写地址；公共设置在末尾 Host srv-* 块。
+# 某台机器账号或端口不同时，在它自己的块里加 User / Port（先匹配到的值优先）。
+
+Host srv-3090
+  HostName 10.180.98.216
+
+Host srv-4090a
+  HostName 10.180.96.175
+
+Host srv-4090b
+  HostName 10.180.102.93
+
+Host srv-a100
+  HostName 10.180.98.222
+
+Host srv-iflux
+  HostName 10.195.238.189
+
+Host srv-*
+  User wjh
+  Port 30002
+  StrictHostKeyChecking accept-new
+  ServerAliveInterval 15
+  ServerAliveCountMax 3
+  ControlMaster auto
+  # scripts/connect.sh / MCP supply the project-specific ControlPath and known_hosts.
+  ControlPath none
+  ControlPersist 8h

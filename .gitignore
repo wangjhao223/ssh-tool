@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+mcp/known_hosts
+mcp/known_hosts.old
+downloads/
