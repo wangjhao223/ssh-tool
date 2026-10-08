@@ -3,3 +3,4 @@ __pycache__/
 mcp/known_hosts
 mcp/known_hosts.old
 downloads/
+logs/

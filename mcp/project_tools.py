@@ -98,7 +98,7 @@ def read_project(args):
 def tools():
     return [('read_project',read_project,'项目索引；传 files 批量通读源码，pending 给续读位置。覆盖不全不代表通读完成。',
         dict(type='object',required=['path'],additionalProperties=False,properties=dict(
-            path={'type':'string'},server={'type':'string'},
+            path={'type':'string'},server={'type':'string','description':local_connection.server_arg_desc()},
             files={'type':'array','minItems':1,'maxItems':8,'items':dict(type='object',required=['path'],additionalProperties=False,properties=dict(
                 path={'type':'string'},start_line={'type':'integer','minimum':1},max_lines={'type':'integer','minimum':1,'maximum':2000,'default':1000}))},
             depth={'type':'integer','minimum':0,'maximum':10,'default':4},

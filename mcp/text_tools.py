@@ -151,7 +151,7 @@ def search_text(args):
 def tools():
     return [('search_text',search_text,'目录/文件字面搜索，默认 20 处及上下各 2 行；incomplete 表示未完整覆盖。',
         dict(type='object',required=['path','query'],additionalProperties=False,properties=dict(
-            path={'type':'string'},query={'type':'string'},server={'type':'string'},file_glob={'type':'string','default':'*'},
+            path={'type':'string'},query={'type':'string'},server={'type':'string','description':local_connection.server_arg_desc()},file_glob={'type':'string','default':'*'},
             context_lines={'type':'integer','minimum':0,'maximum':10,'default':2},
             limit={'type':'integer','minimum':1,'maximum':100,'default':20},
             max_chars={'type':'integer','minimum':256,'maximum':12000,'default':6000},

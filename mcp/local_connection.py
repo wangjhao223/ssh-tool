@@ -60,6 +60,28 @@ def resolve_server(server=None):
     return name
 
 
+def server_arg_desc():
+    """Shared server-parameter description listing the configured servers."""
+    try:
+        names = configured_servers()
+    except OSError:
+        names = []
+    try:
+        default = resolve_server()
+    except (OSError, LoginError):
+        default = ""
+    text = "服务器名，可省略 srv- 前缀"
+    if default:
+        text += f"；省略时用默认服务器 {default}"
+    else:
+        text += "；DEFAULT_SERVER 未配置或无效，调用时必须显式指定"
+    if names:
+        text += "；已配置: " + ", ".join(names)
+    else:
+        text += "；ssh_config 当前没有配置任何 srv-<名字> 服务器"
+    return text
+
+
 def runtime_dir():
     identity = hashlib.sha256(os.fsencode(PROJECT_ROOT)).hexdigest()[:16]
     path = f"/tmp/remote-ws-{os.getuid()}-{identity}"
@@ -81,14 +103,25 @@ def ssh_args():
 
 
 def is_connected(host):
-    result = subprocess.run(ssh_args() + ["-O", "check", host],
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    """Local control-socket check; a local subprocess failure means not connected."""
+    try:
+        result = subprocess.run(ssh_args() + ["-O", "check", host],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return False
     return result.returncode == 0
 
 
 def ssh_params(host):
-    result = subprocess.run(ssh_args() + ["-G", host], stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=10)
+    try:
+        result = subprocess.run(ssh_args() + ["-G", host], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise LoginError("本地 ssh -G 读取项目 SSH 配置超过 10 秒没有返回；请检查本地 ssh 状态后重试。") from None
+    except subprocess.SubprocessError as error:
+        raise LoginError(f"读取项目 SSH 配置失败: {error}") from error
+    except OSError as error:
+        raise LoginError(f"无法执行本地 ssh: {error}") from error
     if result.returncode:
         raise LoginError("无法读取项目 SSH 配置: " + result.stderr.strip())
     values = {}
@@ -124,7 +157,10 @@ def diagnose(server=None, timeout=3, probe_session=True):
     """Check one configured host; no login window, password prompt or writes."""
     name = resolve_server(server)
     host = "srv-" + name
-    params = ssh_params(host)
+    try:
+        params = ssh_params(host)
+    except LoginError as error:
+        return {"server": name, "endpoint": host, "state": "local_error", "summary": str(error)}
     result = {"server": name, "endpoint": f"{params['user']}@{params['hostname']}:{params['port']}"}
 
     def state(code, summary):
@@ -170,17 +206,34 @@ def preflight(server=None):
     return result
 
 
+def window_stamp(host):
+    return os.path.join(runtime_dir(), f"window-{host}.stamp")
+
+
 def login_busy(host):
     with open(os.path.join(runtime_dir(), f"login-{host}.lock"), "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
-        stamp = os.path.join(runtime_dir(), f'window-{host}.stamp')
         try:
-            return time.time() - os.stat(stamp).st_mtime < 15
+            return time.time() - os.stat(window_stamp(host)).st_mtime < 15
         except FileNotFoundError:
             return False
+
+
+def login_window_state(host):
+    """Login-window evidence only, no network access.
+
+    working  - a login window is running (connect.sh holds the login lock) or was just opened
+    starting - a window was opened but has not started working yet (stamp exists but is stale)
+    ended    - no window is visible (connect.sh removed the stamp on exit)
+    """
+    if login_busy(host):
+        return "working"
+    if os.path.exists(window_stamp(host)):
+        return "starting"
+    return "ended"
 
 
 def launch_window(server):
@@ -216,7 +269,7 @@ def request_login(server):
         if login_busy(host):
             return 'login_pending'
         preflight(server)
-        stamp = os.path.join(runtime_dir(), f'window-{host}.stamp')
+        stamp = window_stamp(host)
         with open(stamp, 'w'):
             pass
         try:
@@ -243,7 +296,7 @@ def ensure_connected(server, timeout=120):
         already_open = login_busy(host)
         if not already_open:
             preflight(server)
-            stamp = os.path.join(runtime_dir(), f'window-{host}.stamp')
+            stamp = window_stamp(host)
             with open(stamp, 'w'):
                 pass
             try:
@@ -257,16 +310,23 @@ def ensure_connected(server, timeout=120):
         while time.monotonic() < deadline:
             if is_connected(host):
                 return
-            busy = login_busy(host)
-            if busy:
+            window = login_window_state(host)
+            if window == "working":
                 seen_login = True
-            elif seen_login:
+                started = time.monotonic()
+            elif window == "ended" and seen_login:
+                # 窗口退出与复用连接就绪之间可能只差一瞬间，补一次检查再下结论
+                time.sleep(1)
+                if is_connected(host):
+                    return
                 report = preflight(server)
                 if report["state"] == "session_present":
                     return
-                raise LoginError("[login_incomplete] 登录未完成，可能是认证失败或用户取消；请查看登录窗口，不自动重试。")
+                raise LoginError("[login_incomplete] 登录窗口已结束但没有建立连接，可能是认证失败或用户取消；请查看登录窗口，不自动重试。")
             elif time.monotonic() - started > 15:
-                raise LoginError("登录窗口没有开始连接，请使用项目的一键连接入口后重试。")
+                if window == "starting":
+                    raise LoginError("[login_nostart] 还没有窗口开始工作的证据：登录窗口已打开，但连接脚本一直没有开始连接。请在窗口里完成登录；窗口若已关闭，请用项目的一键连接入口重新打开。")
+                raise LoginError("[login_nostart] 还没有窗口开始工作的证据：没有登录窗口在运行。请使用项目的一键连接入口打开登录窗口后重试。")
             time.sleep(1)
         raise LoginError("仍未检测到连接。请在登录窗口完成密码输入，然后重试原操作；本次远程命令尚未执行。")
 

@@ -45,7 +45,7 @@ do {
     $Host.UI.RawUI.WindowTitle = "remote-ws | $Server"
     Write-Host "Project: $projectRoot"
     Write-Host "Server: $Server | WSL: $Distribution | User: $WslUser"
-    Write-Host 'Enter your SSH password in this window. Codex cannot read it.'
+    Write-Host 'Enter your SSH password in this window. Kimi Code cannot read it.'
     $wslRoot = (& wsl.exe -d $Distribution -u $WslUser --exec wslpath -u $projectRoot)
     if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the project path in WSL.' }
     $wslRoot = ($wslRoot -join "`n").Trim()

@@ -15,8 +15,13 @@ if [ "${2:-}" = "--close" ]; then
   exit 0
 fi
 if "${SSH[@]}" -O check "$HOST" >/dev/null 2>&1; then
-  echo "$HOST 已连接"
-  exit 0
+  # -O check 只证明控制进程活着，再用只读命令确认链路真的可用
+  if "${SSH[@]}" -T -o BatchMode=yes -o ConnectTimeout=5 "$HOST" true >/dev/null 2>&1; then
+    echo "$HOST 已连接"
+    exit 0
+  fi
+  echo "复用连接已失效（控制进程还在但链路不通），已清理，继续登录 $HOST"
+  "${SSH[@]}" -O exit "$HOST" >/dev/null 2>&1 || true
 fi
 python3 "$DIR/mcp/local_connection.py" preflight "$SERVER"
 exec 9>"$RUNTIME/login-$HOST.lock"
@@ -24,6 +29,10 @@ if ! flock -n 9; then
   echo "$HOST 的登录窗口已打开，请在原窗口完成登录。"
   exit 0
 fi
+# 登录期间的“窗口在工作”标记：启动时刷新、退出时清理（MCP 靠它区分窗口还没开始和窗口已结束）
+STAMP="$RUNTIME/window-$HOST.stamp"
+trap 'rm -f "$STAMP"' EXIT
+: > "$STAMP"
 if "${SSH[@]}" -O check "$HOST" >/dev/null 2>&1; then
   echo "$HOST 已连接"
   exit 0

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "remote-ws": {
+      "command": "python3",
+      "args": ["-u", "/root/workplace/ssh-tool/mcp/remote_ws_mcp.py"],
+      "cwd": "/root/workplace/ssh-tool",
+      "env": {
+        "REMOTE_WS_LOGIN_GUI": "1"
+      },
+      "toolTimeoutMs": 2050000
+    }
+  }
+}

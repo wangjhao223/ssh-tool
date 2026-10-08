@@ -45,7 +45,7 @@ def get_guide(args):
                      directories=dict(zip(('CODE_ROOT','DATA_ROOT'), file_tools.roots_config()[:2])),
                      conda_root=config.get('CONDA_ROOT', '/home/wjh/miniconda3'),
                      local_workspace=local_connection.PROJECT_ROOT,
-                     download_directory=str(file_tools.DOWNLOADS), project_config='.codex/config.toml')
+                     download_directory=str(file_tools.DOWNLOADS), project_config='.kimi-code/mcp.json')
     else:
         contents = sections()
         if topic == 'index':

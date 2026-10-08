@@ -6,7 +6,7 @@ Configuration (next to this file):
   ssh_config      Host srv-<name> entries (ControlMaster connection reuse)
   remote-ws.conf  conventions (DEFAULT_SERVER, CODE_ROOT, DATA_ROOT, CONDA_ROOT)
 SSH never prompts for a password here (BatchMode); it reuses the ControlMaster
-connection opened by scripts/connect.sh. Codex can request a visible local login window;
+connection opened by scripts/connect.sh. Kimi Code can request a visible local login window;
 the user types the password directly into SSH, never into MCP.
 Write guard: exec/run_background refuse commands that would write outside
 CODE_ROOT/DATA_ROOT (plus /tmp, /var/tmp, /dev/shm); after the user approves,
@@ -53,9 +53,10 @@ class ToolError(Exception):
 
 
 def conf():
+    # DEFAULT_SERVER 保留配置原始值：只用目录约定的工具不因默认服务器无效而失败，
+    # 服务器名校验只在实际使用它的 resolve_server() 里做。
     c = dict(DEFAULTS)
     c.update({k: v for k, v in local_connection.read_config().items() if v})
-    c["DEFAULT_SERVER"] = local_connection.resolve_server()
     for k in ("CODE_ROOT", "DATA_ROOT", "CONDA_ROOT"):
         c[k] = c[k].rstrip("/") or "/"
     return c
@@ -113,8 +114,8 @@ def connect_cmd(name):
 
 def not_connected_hint(name):
     return (f"无法免密连接 {HOST_PREFIX}{name}。可调用 connect(server=\"{name}\") 打开本地登录窗口，"
-            f"或双击本项目的 Connect.cmd。备用 WSL 命令:\n  {connect_cmd(name)}\n"
-            f"输入一次服务器密码（连接空闲 8 小时后断开）后再重试。不要索要或处理密码。")
+            f"或把下面的命令原样交给用户在 WSL 终端执行:\n  {connect_cmd(name)}\n"
+            f"输入一次服务器密码（连接空闲 8 小时后断开）后再重试。不要索要、保存或处理密码。")
 
 
 # ---------------------------------------------------------------- write guard
@@ -122,19 +123,26 @@ def not_connected_hint(name):
 WRITE_EXEMPT_ROOTS = ("/tmp", "/var/tmp", "/dev/shm")
 DEVICE_TARGETS = ("/dev/null", "/dev/zero", "/dev/full", "/dev/stdout",
                   "/dev/stderr", "/dev/tty", "/dev/fd", "/proc/self/fd")
-SYSTEM_CMD_RE = re.compile(r"(?<![/\w])(?:sudo|doas|apt|apt-get|aptitude|dpkg|snap|systemctl|service|crontab|"
-                           r"shutdown|reboot|useradd|usermod|userdel|passwd|mkfs(?:\.\w+)?|fdisk|parted|"
-                           r"mknod|losetup|swapon|swapoff|sysctl|exportfs|iptables|ufw|mount|umount)\b")
-PIPED_SHELL_RE = re.compile(r"\|\s*(?:sudo\s+)?[\w./-]*(?:ba|z|da)?sh\b|(?:ba|z|da)?sh\s+<\(")
+SYSTEM_COMMANDS = {"sudo", "doas", "apt", "apt-get", "aptitude", "dpkg", "snap", "systemctl", "service",
+                   "crontab", "shutdown", "reboot", "useradd", "usermod", "userdel", "passwd", "fdisk",
+                   "parted", "mknod", "losetup", "swapon", "swapoff", "sysctl", "exportfs", "iptables",
+                   "ufw", "mount", "umount"}
+MKFS_RE = re.compile(r"mkfs(?:\.\w+)?")
+SHELL_RE = re.compile(r"(?:ba|z|da)?sh")
+PROC_SUBST_RE = re.compile(r"(?:ba|z|da)?sh\s+<\(")
 REDIRECT_RE = re.compile(r"(\d*&>>|\d*&>|\d*>>|\d*>\||\d*>)(\s*)([^\s;|&()]+)")
-PIP_INSTALL_RE = re.compile(r"(\S*pip3?)\s+install\b")
+PIP_EXE_RE = re.compile(r"\S*pip3?")
+TAR_LONG_MODES = {"--create": "c", "--extract": "x", "--get": "x", "--list": "t",
+                  "--update": "u", "--append": "r", "--delete": "d"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
 OP_TOKENS = {"|", "||", "|&", "&&", ";", "(", ")", "&"}
 SKIP_TOKENS = {">", ">>", ">|", "&>", "&>>", "<", "<<", "<<<", ">&", "<&"}
 WRAPPERS = {"nice", "env", "timeout", "command", "builtin", "stdbuf", "nohup", "setsid"}
-WRITE_ALL_ARGS = {"rm", "rmdir", "touch", "shred", "chattr", "truncate", "fallocate", "setfacl"}
+WRITE_ALL_ARGS = {"rm", "mv", "mkdir", "rmdir", "touch", "shred", "chattr", "truncate", "fallocate", "setfacl"}
 WRITE_SKIP_FIRST = {"chmod", "chown", "chgrp"}   # 第一个位置参数是模式/属主，不是路径
-WRITE_LAST_ARG = {"cp", "mv", "ln", "scp", "rsync", "install"}
+WRITE_LAST_ARG = {"cp", "ln", "scp", "rsync", "install"}
+GZIP_CMDS = {"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "zstd", "unzstd"}
+FIND_WRITE_FLAGS = {"delete", "exec", "execdir", "ok", "okdir"}
 CONSUMES = {
     "curl": {"-o", "--output"},
     "wget": {"-O", "--output-document"},
@@ -145,6 +153,7 @@ CONSUMES = {
     "setfacl": {"-m", "-x", "-d", "--modify", "--remove"},
     "git": {"-C"},
     "nice": {"-n"},
+    "mkdir": {"-m", "--mode"},
 }
 
 
@@ -188,7 +197,7 @@ def split_tokens(command):
 
 
 def tar_write_targets(toks):
-    """解析 tar 参数，返回 (种类, 目标) 列表：打包写 -f 目标，解包写 -C 目录或 cwd。"""
+    """解析 tar 参数，返回 (种类, 目标) 列表：打包/改档写 -f 目标，解包写 -C 目录或 cwd。"""
     modes, fval, cval, pos = "", None, None, []
     i = 0
     while i < len(toks):
@@ -197,17 +206,21 @@ def tar_write_targets(toks):
         if t == "--":
             pos.extend(toks[i:])
             break
-        if t.startswith("--file="):
-            fval = t.split("=", 1)[1]
-        elif t == "--file":
-            fval = toks[i] if i < len(toks) else None
-            i += 1
-        elif t.startswith("--directory="):
-            cval = t.split("=", 1)[1]
-        elif t == "--directory":
-            cval = toks[i] if i < len(toks) else None
-            i += 1
-        elif (t.startswith("-") and len(t) > 1) or (re.fullmatch(r"[A-Za-z]+", t) and not pos and not modes):
+        if t.startswith("--"):
+            # 长选项单独解析，不逐字母累加；未知长选项直接忽略。
+            name, sep, value = t.partition("=")
+            if name in ("--file", "--directory"):
+                if not sep:
+                    value = toks[i] if i < len(toks) else None
+                    i += 1
+                if name == "--file":
+                    fval = value
+                else:
+                    cval = value
+            elif name in TAR_LONG_MODES:
+                modes += TAR_LONG_MODES[name]
+            continue
+        if (t.startswith("-") and len(t) > 1) or (re.fullmatch(r"[A-Za-z]+", t) and not pos and not modes):
             body = t[1:] if t.startswith("-") else t
             for j, ch in enumerate(body):
                 if ch in "fC":
@@ -221,10 +234,10 @@ def tar_write_targets(toks):
                         cval = rest
                     break
                 modes += ch
-        else:
-            pos.append(t)
+            continue
+        pos.append(t)
     out = []
-    if any(m in modes for m in "cru") and fval:
+    if any(m in modes for m in "crud") and fval:
         out.append(("tar 归档", fval))
     elif "x" in modes:
         out.append(("tar 解压", cval or "."))
@@ -254,22 +267,42 @@ def find_write_violations(command, cwd, conda_env):
             return
         add(f"{kind}: {token}（解析为 {p}）")
 
-    hits = sorted(set(SYSTEM_CMD_RE.findall(command)))
-    if hits:
-        add("系统级命令 " + ", ".join(hits) + "（修改系统状态，与路径无关）")
-    if PIPED_SHELL_RE.search(command):
-        add("管道/进程替换执行脚本（| sh、bash <(...) 等），可能任意写盘")
-    for m in PIP_INSTALL_RE.finditer(command):
-        exe = m.group(1)
+    def check_cmd_pos(name):
+        """命令位 token（已去路径）检查：系统级命令、带子命令的 mkfs。"""
+        if name in SYSTEM_COMMANDS or MKFS_RE.fullmatch(name):
+            add(f"系统级命令 {name}（修改系统状态，与路径无关）")
+
+    def check_pip(exe, fl):
+        """命令位是 pip 且带 install：按安装目标是否越界判定。"""
         if "/" in exe:
-            if is_under(norm_path(exe, cwd_n), roots):
-                continue            # 允许区域内的虚拟环境 pip
-            add(f"pip install 使用越界环境 {exe}")
-            break
-        if conda_env or re.search(r"(?:^|\s)--user(?:\s|$)", command):
-            continue                # conda 环境或 --user 都只写 /home/wjh
-        add("pip install 未指定 conda_env（会写入系统 python 目录）")
-        break
+            if not is_under(norm_path(exe, cwd_n), roots):
+                add(f"pip install 使用越界环境 {exe}")
+        elif not (conda_env or "user" in fl):
+            add("pip install 未指定 conda_env（会写入系统 python 目录）")
+
+    def piped_shells(toks):
+        """|、|& 之后进入的命令位若是 shell 则记录；sudo 和包装命令透明穿透。"""
+        out, piped, i = set(), False, 0
+        while i < len(toks):
+            tok = toks[i]
+            i += 1
+            if tok in OP_TOKENS:
+                piped = tok in ("|", "|&")
+                continue
+            if piped:
+                base = tok.rsplit("/", 1)[-1]
+                if base in WRAPPERS or base in ("sudo", "doas"):
+                    continue                    # 透明跳过，真正的命令在后
+                if SHELL_RE.fullmatch(base):
+                    out.add(base)
+                piped = False
+        return out
+
+    tokens = split_tokens(command)
+    for shell in sorted(piped_shells(tokens)):
+        add(f"管道执行 shell（| {shell}），可能任意写盘")
+    if PROC_SUBST_RE.search(command):
+        add("进程替换执行脚本（bash <(...) 等），可能任意写盘")
 
     write_targets, cd_targets = [], []
     write_ops = 0
@@ -284,7 +317,10 @@ def find_write_violations(command, cwd, conda_env):
 
     def handle_simple(cmd, a, fl):
         nonlocal write_ops
-        if cmd in WRITE_ALL_ARGS:
+        if cmd == "install" and any(f == "d" or (f.isalpha() and "d" in f) for f in fl):
+            write_ops += len(a)                 # install -d 的位置参数全是新建目录
+            write_targets.extend(("install -d 写入", x) for x in a)
+        elif cmd in WRITE_ALL_ARGS:
             write_ops += len(a)
             write_targets.extend(("写入", x) for x in a)
         elif cmd in WRITE_SKIP_FIRST:
@@ -321,22 +357,39 @@ def find_write_violations(command, cwd, conda_env):
         elif cmd == "mktemp":
             write_ops += 1
             write_targets.extend(("mktemp 目录", x) for x in a)
-        elif cmd == "git" and "clone" in a:
-            write_ops += 1
-            idx = a.index("clone")
-            if len(a) >= idx + 3:
-                write_targets.append(("git clone 目录", a[idx + 2]))
+        elif cmd in GZIP_CMDS:
+            stdout = any(f in ("c", "stdout", "to-stdout") or (f.isalpha() and "c" in f) for f in fl)
+            if not stdout:                      # -c/--stdout 只写标准输出
+                write_ops += len(a)
+                write_targets.extend(("压缩写入", x) for x in a)
+        elif cmd == "find" and fl & FIND_WRITE_FLAGS:
+            write_ops += len(a)                 # -delete/-exec 等可写任意路径
+            write_targets.extend(("find 写入", x) for x in a)
+        elif cmd == "git":
+            if a and a[0] == "clean":
+                write_ops += 1                  # 由 cwd/cd 越界规则判定
+            elif "clone" in a:
+                write_ops += 1
+                idx = a.index("clone")
+                if len(a) >= idx + 3:
+                    write_targets.append(("git clone 目录", a[idx + 2]))
         elif cmd == "cd" and a:
             cd_targets.append(a[-1])
 
-    tokens = split_tokens(command)
-    cur, args, flags, expect, timeout_used = None, [], set(), None, False
+    cur, cur_raw, args, flags, expect, timeout_used = None, None, [], set(), None, False
 
     def end_cmd():
-        nonlocal cur, args, flags, expect
+        nonlocal cur, cur_raw, args, flags, expect
         if cur is not None and cur not in WRAPPERS:
             handle_simple(cur, args, flags)
-        cur, args, flags, expect = None, [], set(), None
+            if "install" in args:
+                if PIP_EXE_RE.fullmatch(cur_raw or ""):
+                    check_pip(cur_raw, flags)
+                elif re.fullmatch(r"python[\d.]*", cur):
+                    exe = next((x for x in args if PIP_EXE_RE.fullmatch(x)), None)
+                    if exe:
+                        check_pip(exe, flags)
+        cur, cur_raw, args, flags, expect = None, None, [], set(), None
 
     i = 0
     while i < len(tokens):
@@ -355,7 +408,7 @@ def find_write_violations(command, cwd, conda_env):
             wt = tar_write_targets(sub)
             write_targets.extend(wt)
             write_ops += bool(wt)
-            cur = None
+            cur, cur_raw = None, None
             continue
         if expect:
             if cur == "git" and expect == "-C":
@@ -372,13 +425,17 @@ def find_write_violations(command, cwd, conda_env):
         if ENV_ASSIGN_RE.match(tok) and (cur is None or cur == "env"):
             continue
         if cur is None:
-            cur = tok.rsplit("/", 1)[-1]
+            base = tok.rsplit("/", 1)[-1]
+            check_cmd_pos(base)
+            cur, cur_raw = base, tok
             continue
         if cur == "timeout" and not timeout_used:
             timeout_used = True            # timeout 的第一个位置参数是时长
             continue
         if cur in WRAPPERS:
-            cur = tok.rsplit("/", 1)[-1]   # 透明包装，真正的命令在后
+            base = tok.rsplit("/", 1)[-1]
+            check_cmd_pos(base)            # 透明包装，真正的命令在后
+            cur, cur_raw = base, tok
             continue
         args.append(tok)
     end_cmd()
@@ -552,13 +609,25 @@ def t_status(args):
     all_servers = args.get('all', False)
     if type(all_servers) is not bool:
         raise ToolError('all 必须是布尔值')
-    name, _ = resolve_server(args.get('server'))
+    # 两个分支都用原始 DEFAULT_SERVER 展示：默认配置有误也要能看到实际值；
+    # 只有非 all 分支需要校验本次调用的服务器（resolve_server）。
     c = conf()
-    lines = [f"default: {c['DEFAULT_SERVER']}"]
+    default = (c.get('DEFAULT_SERVER') or '').strip()
+    if default.startswith(HOST_PREFIX):
+        default = default[len(HOST_PREFIX):]
+    if all_servers:
+        server_names = servers()
+        if not server_names:
+            raise ToolError(f"ssh_config 里没有配置任何 {HOST_PREFIX}<名字> 服务器，无法列出状态。")
+    else:
+        server_names = [resolve_server(args.get('server'))[0]]
+    lines = [f"default: {default or '(未配置 DEFAULT_SERVER)'}"]
+    if all_servers and default not in server_names:
+        lines.append(f"⚠️ 默认服务器无效，调用其他工具时请显式指定 server（可选: {', '.join(server_names)}）")
     if verbose:
         lines += [f"{k}={c[k]}" for k in ('CODE_ROOT','DATA_ROOT','CONDA_ROOT')]
-    for name in (servers() if all_servers else [name]):
-        host = HOST_PREFIX + name
+    for sname in server_names:
+        host = HOST_PREFIX + sname
         if connected(host):
             state = "session_present"
         elif local_connection.login_busy(host):
@@ -569,7 +638,7 @@ def t_status(args):
         if verbose:
             p = ssh_params(host)
             endpoint = f" {p.get('user', '?')}@{p.get('hostname', '?')}:{p.get('port', '?')}"
-        lines.append(f"{name}: {state}{endpoint}")
+        lines.append(f"{sname}: {state}{endpoint}")
     return "\n".join(lines)
 
 
@@ -583,7 +652,7 @@ def t_exec(args):
     timeout = int(args.get("timeout_sec") or 120)
     timeout = max(1, min(timeout, 1800))
     viol = find_write_violations(command, rdir, args.get("conda_env"))
-    if viol and not args.get("confirmed"):
+    if viol and args.get("confirmed") is not True:
         raise ToolError(confirm_text(viol))
     script = "\n".join(
         [f"cd {qpath(rdir)} || {{ echo 'remote-ws: 目录不存在: {rdir}' >&2; exit 97; }}"]
@@ -616,7 +685,7 @@ def t_run_background(args):
     rdir = remote_dir(args.get("cwd"))
     ldir = log_dir(args.get("project"))
     viol = find_write_violations(command, rdir, args.get("conda_env"))
-    if viol and not args.get("confirmed"):
+    if viol and args.get("confirmed") is not True:
         raise ToolError(confirm_text(viol))
     inner = "\n".join(env_prelude(args.get("conda_env"), args.get("gpus")) + [command])
     job_id = uuid.uuid4().hex
@@ -708,7 +777,7 @@ def t_stop_job(args):
         raise ToolError(f"任务身份无法核实（{j['status']}），未发送信号；先核实实际进程。")
     if j["status"] != "running" or not j.get("pid"):
         return f"任务 {j.get('name')} 当前不在运行（{j['status']}），无需停止。"
-    result = job_tools.request(name, 'stop', log=j['log'], expected=j, force=bool(args.get('force')))
+    result = job_tools.request(name, 'stop', log=j['log'], expected=j, force=args.get('force') is True)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -759,7 +828,8 @@ def t_conda_envs(args):
               "  [ -x \"$e/bin/python\" ] || continue\n"
               "  v=$(\"$e/bin/python\" -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])' 2>/dev/null)\n"
               "  t=$(\"$e/bin/python\" -c 'import torch;print(torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null || echo '无 torch')\n"
-              "  echo \"$(basename \"$e\"): python $v, torch: $t\"\n"
+              "  n=$(basename \"$e\"); [ \"$e\" = " + qpath(c['CONDA_ROOT']) + " ] && n=base\n"
+              "  echo \"$n: python $v, torch: $t\"\n"
               "done\n")
     rc, out, err, el = ssh_run(name, script, 120)
     return fmt_result(rc, out, err, el), rc != 0
@@ -786,7 +856,9 @@ def t_init_project(args):
 
 
 S = {"type": "string"}
-SERVER_ARG = {"type": "string", "description": "默认 DEFAULT_SERVER"}
+
+
+SERVER_ARG = {"type": "string", "description": local_connection.server_arg_desc()}
 CWD_ARG = {"type": "string", "description": "远端目录，默认/相对 CODE_ROOT，支持 ~/"}
 ENV_ARG = {"type": "string", "description": "已有 Conda 环境；省略用系统环境"}
 GPU_ARG = {"type": "string", "description": "CUDA_VISIBLE_DEVICES，如 0,1；先查 gpus"}

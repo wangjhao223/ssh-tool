@@ -15,6 +15,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -24,7 +25,7 @@ import local_connection as connection
 MAX_TEXT = 24000
 EDIT_LIMIT = 4 * 1024 * 1024
 DOWNLOADS = Path(connection.PROJECT_ROOT) / "downloads"
-ACTIVE = {"starting", "running", "cancelling"}
+ACTIVE = {"starting", "running"}
 
 
 class FileToolError(Exception):
@@ -355,7 +356,7 @@ def ensure_login(server):
         if os.environ.get("REMOTE_WS_LOGIN_GUI") == "1":
             connection.ensure_connected(server)
         else:
-            raise FileToolError("尚未连接，请调用 connect 或双击 Connect.cmd 登录后重试")
+            raise FileToolError("尚未连接，请调用 connect 打开登录窗口，或运行 scripts/connect.sh 登录后重试")
 
 
 def ssh_command(server, source=None):
@@ -380,7 +381,8 @@ def remote_json(server, payload, timeout=120, source=None):
         extra = {'edit': '；编辑状态不确定，请重新读取，不自动重写',
                  'stop': '；停止状态不确定，请先查询 jobs，不自动重复停止'}.get(payload['operation'], '')
         classified = connection.classify_ssh_error(result.stderr.decode('utf-8', 'replace'))
-        raise FileToolError((str(classified) if classified else "远端 Python 不可用或响应中断，请 diagnose") + extra) from error
+        raise FileToolError((f"[{classified[0]}] {classified[1]}" if classified
+                             else "远端 Python 不可用或响应中断，请 diagnose") + extra) from error
     if not value.get('ok'):
         message = value.get('error', '远程操作失败')
         if value.get('uncertain'):
@@ -534,7 +536,13 @@ def verbosity(args):
     return value
 
 
-def report(state, verbose=False):
+SUMMARY_KEYS = ('task_id','server','remote_path','state','phase','downloaded_bytes','total_size','progress',
+                'verified_bytes','verification_progress','speed_bytes_sec','eta_sec','local_path','windows_path','sha256')
+# Task rows are a narrower view: no byte/hash detail, always able to carry message.
+ROW_KEYS = tuple(k for k in SUMMARY_KEYS if k not in ('verified_bytes','sha256')) + ('message',)
+
+
+def report_state(state, verbose=False):
     size = state.get('total_size')
     count = state.get('downloaded_bytes', 0)
     result = dict(state)
@@ -553,12 +561,14 @@ def report(state, verbose=False):
         result['speed_bytes_sec'] = 0
         result['eta_sec'] = None
     if not verbose:
-        keys = ('task_id','server','remote_path','state','phase','downloaded_bytes','total_size','progress',
-                'verified_bytes','verification_progress','speed_bytes_sec','eta_sec','local_path','windows_path','sha256')
-        result = {key: result[key] for key in keys if key in result}
+        result = {key: result[key] for key in SUMMARY_KEYS if key in result}
         if state['state'] in ('interrupted', 'cancelled') and state.get('message'):
             result['message'] = state['message']
-    return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+    return result
+
+
+def report(state, verbose=False):
+    return json.dumps(report_state(state, verbose), ensure_ascii=False, separators=(',', ':'))
 
 
 def list_downloads(args):
@@ -581,12 +591,8 @@ def list_downloads(args):
     records.sort(key=lambda s: (s.get('created_at', 0), s['task_id']), reverse=True)
     rows = []
     for state in records[offset:offset+limit]:
-        row = json.loads(report(state, verbose))
-        keys = ('task_id', 'server', 'remote_path', 'state', 'phase', 'downloaded_bytes',
-                'total_size', 'progress', 'verification_progress', 'speed_bytes_sec', 'eta_sec',
-                'local_path', 'windows_path', 'message')
-        if verbose:
-            keys += ('created_at','updated_at')
+        row = report_state(state, verbose)
+        keys = ROW_KEYS + (('created_at','updated_at') if verbose else ())
         rows.append({k: row[k] for k in keys if k in row})
         if len(json.dumps(rows, ensure_ascii=False)) > MAX_TEXT - 2000:
             rows.pop()
@@ -604,7 +610,7 @@ def busy_report():
             try:
                 row = load_state(path.stem)
                 if row['state'] in ACTIVE:
-                    active.append(json.loads(report(row)))
+                    active.append(report_state(row))
             except (OSError, ValueError, KeyError, TypeError, FileToolError):
                 pass
     return json.dumps(dict(state='busy', task_id=active[0]['task_id'] if active else None,
@@ -819,7 +825,7 @@ def worker(task_id, lock_fd):
         payload = dict(operation='download', path=state['remote_path'], roots=state['roots'],
                        offset=state['downloaded_bytes'], identity=state['identity'], prefix_sha256=h.hexdigest())
         # Capture stderr to a local temporary file to avoid pipe backpressure.
-        with tempfile_stderr() as errors:
+        with tempfile.TemporaryFile() as errors:
             child = subprocess.Popen(ssh_command(state['server']), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=errors, bufsize=0)
             encoded = memoryview(json.dumps(payload).encode())
@@ -924,14 +930,9 @@ def worker(task_id, lock_fd):
         os.close(lock_fd)
 
 
-def tempfile_stderr():
-    import tempfile
-    return tempfile.TemporaryFile()
-
-
 def tools():
     string = {'type': 'string'}
-    server = {**string, 'description': '默认 DEFAULT_SERVER'}
+    server = {**string, 'description': connection.server_arg_desc()}
     path = {**string, 'description': '远端路径，相对 CODE_ROOT'}
     verbose = {'type':'boolean','default':False,'description':'返回详情'}
     def schema(properties, required):
