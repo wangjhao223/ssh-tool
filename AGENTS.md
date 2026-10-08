@@ -52,3 +52,10 @@
 - `mcp/ssh_config`：加服务器时写 `Host srv-<名字>` 和 `HostName <IP>`；某台机器账号或端口不同时，在它自己的块里加 `User` 或 `Port`。不要改 `~/.ssh/config`。
 - 服务器上不放本方案的辅助脚本或配置，所有工具都在本目录。不新增 README 或永久测试目录。
 - 改动约定、服务器或工具时，同步更新本文件、`mcp/guide.md` 和工具描述。
+
+## GitHub 发布
+
+- 仓库 `git@github.com:wangjhao223/ssh-tool.git`（公开）：`main` 是 Codex 版，`kimi-code` 分支是本方案。
+- 推送用专用 key `~/.ssh/id_ed25519_github`（公钥已添加到 GitHub；私钥只在 `~/.ssh`，绝不复制进项目目录、绝不提交）。
+- 推送方式：`GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes"`；提交身份 `wangjhao223` / `wangjhao223@users.noreply.github.com`。
+- 流程：克隆到 `/tmp` 临时目录 → 切 `kimi-code` 分支 → rsync 同步（排除 `.git`、`__pycache__`、`*.pyc`、`mcp/known_hosts*`、`downloads/`、`logs/`）→ commit → push。
