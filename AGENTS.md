@@ -55,7 +55,7 @@
 
 ## GitHub 发布
 
-- 仓库 `git@github.com:wangjhao223/ssh-tool.git`（公开）：`main` 是 Codex 版，`kimi-code` 分支是本方案。
-- 推送用专用 key `~/.ssh/id_ed25519_github`（公钥已添加到 GitHub；私钥只在 `~/.ssh`，绝不复制进项目目录、绝不提交）。
+- 本目录持有 GitHub 账号 `wangjhao223` 的推送凭据：专用 key `~/.ssh/id_ed25519_github`（公钥已添加到 GitHub；私钥只在 `~/.ssh`，绝不复制进任何被发布的项目、绝不提交）。
 - 推送方式：`GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes"`；提交身份 `wangjhao223` / `wangjhao223@users.noreply.github.com`。
-- 流程：克隆到 `/tmp` 临时目录 → 切 `kimi-code` 分支 → rsync 同步（排除 `.git`、`__pycache__`、`*.pyc`、`mcp/known_hosts*`、`downloads/`、`logs/`）→ commit → push。
+- 用途：把任意本地项目推送到该账号下的仓库（现有仓库的新分支或新建仓库均可），发布其他项目时直接用这套凭据，注意排除目标项目的密钥、数据和缓存文件。
+- 本方案自身发布在 `ssh-tool` 仓库的 `kimi-code` 分支（`main` 是 Codex 版）；同步本方案时用 rsync 排除 `.git`、`__pycache__`、`*.pyc`、`mcp/known_hosts*`、`downloads/`、`logs/`。

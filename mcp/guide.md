@@ -108,4 +108,4 @@ MCP 仅 Python 标准库；改后编译修改文件，stdin 真实 initialize/to
 同步核心 AGENTS.md、对应指南、工具 schema/描述，避免重复详细规则。工具执行参数/路径/版本/身份校验，AGENTS.md 保留无法完全限制的行为底线。
 get_guide 固定本地文件/配置，主题允许列表/分页/字符限额是代码检查，无任意路径/命令/远程连接。指南未加载时可本地读取对应节。
 默认摘要，verbose=true 查连接/任务/下载详情；内部身份令牌/根目录/启动交接字段不暴露。对比相同请求的说明/元数据/结果字节长度，不能等同推算账单 token 比例。
-GitHub 保存完整本地方案：AGENTS.md、Connect.cmd、keepalive.sh、.gitignore、.gitattributes、.kimi-code/mcp.json、scripts/ 及 mcp/ 源码/配置/指南。仓库 wangjhao223/ssh-tool 为公开仓库，main 是 Codex 版、kimi-code 分支是本方案；推送用 ~/.ssh/id_ed25519_github 配 GIT_SSH_COMMAND，私钥只在 ~/.ssh，不复制进项目目录。downloads/、logs/、known_hosts、任务状态、缓存及临时测试文件不提交。克隆后先按本机实际路径/WSL 发行版/用户更新项目配置，配置服务器地址及目录，再将该工作区标为可信并重载 MCP；服务器不部署任何组件。内网地址和本机路径随仓库公开，沿用 Codex 版惯例。
+GitHub 保存完整本地方案：AGENTS.md、Connect.cmd、keepalive.sh、.gitignore、.gitattributes、.kimi-code/mcp.json、scripts/ 及 mcp/ 源码/配置/指南。本方案在 wangjhao223/ssh-tool 仓库（公开）的 kimi-code 分支，main 是 Codex 版。该账号的推送凭据是 ~/.ssh/id_ed25519_github 配 GIT_SSH_COMMAND，也可用于发布其他项目；私钥只在 ~/.ssh，不复制进任何项目目录。downloads/、logs/、known_hosts、任务状态、缓存及临时测试文件不提交。克隆后先按本机实际路径/WSL 发行版/用户更新项目配置，配置服务器地址及目录，再将该工作区标为可信并重载 MCP；服务器不部署任何组件。内网地址和本机路径随仓库公开，沿用 Codex 版惯例。
