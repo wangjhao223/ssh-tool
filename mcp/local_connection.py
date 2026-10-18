@@ -61,25 +61,14 @@ def resolve_server(server=None):
 
 
 def server_arg_desc():
-    """Shared server-parameter description listing the configured servers."""
-    try:
-        names = configured_servers()
-    except OSError:
-        names = []
+    """Shared server-parameter description; the server list lives in status and errors."""
     try:
         default = resolve_server()
     except (OSError, LoginError):
         default = ""
-    text = "服务器名，可省略 srv- 前缀"
     if default:
-        text += f"；省略时用默认服务器 {default}"
-    else:
-        text += "；DEFAULT_SERVER 未配置或无效，调用时必须显式指定"
-    if names:
-        text += "；已配置: " + ", ".join(names)
-    else:
-        text += "；ssh_config 当前没有配置任何 srv-<名字> 服务器"
-    return text
+        return f"服务器名，可省略 srv- 前缀；省略时用默认服务器 {default}"
+    return "服务器名，可省略 srv- 前缀；DEFAULT_SERVER 未配置或无效，调用时必须显式指定"
 
 
 def runtime_dir():

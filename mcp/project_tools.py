@@ -34,8 +34,8 @@ try:
             finally:os.close(fd)
         entries.sort()
         selected=[];used=0
-        for rel,kind,size in entries[a['offset']:a['offset']+a['limit']]:
-            line=f'{kind} {size} {json.dumps(rel,ensure_ascii=False)}\n'
+        for rel,kind,_ in entries[a['offset']:a['offset']+a['limit']]:
+            line=f'{kind} {json.dumps(rel,ensure_ascii=False)}\n'
             cost=len(json.dumps(line,ensure_ascii=False))
             if used+cost>a['max_chars']:
                 if not selected:raise ValueError('路径过长，请提高 max_chars')
@@ -47,21 +47,44 @@ try:
             incomplete=bool(reason or restricted or depth_limited),reason=reason,
             excluded=excluded,restricted=restricted,depth_limited=depth_limited)
     else:
-        results=[];pending=[];used=0
+        results=[];pending=[];used=0;sources=[]
         for item in a['files']:
-            if a['max_chars']-used<256:
+            remaining=a['max_chars']-used
+            if remaining<256:
                 pending.append(item);continue
             p=guarded(base+'/'+item['path'])
             if not under(p,base):raise ValueError('批量读取必须在指定项目真实目录内')
             if os.stat(p).st_uid!=os.getuid():raise ValueError('文件不属于当前服务器用户')
+            skeleton=dict(path=item['path'],sha256='0'*64,
+                blocks=[dict(start_line=item['start_line'],text='',next_line=10**18)],next_line=10**18)
+            room=remaining-len(json.dumps(skeleton,ensure_ascii=False,separators=(',',':')))
+            if room<256:
+                pending.append(item);continue
             value=operation(dict(operation='read',path=p,ranges=[dict(start_line=item['start_line'],max_lines=item['max_lines'])],
-                compact=True,multi_range=False,max_chars=a['max_chars']-used,scope_root=base,require_owner=True))
+                compact=True,multi_range=False,max_chars=room,scope_root=base,require_owner=True))
             value['path']=item['path']
-            results.append(value)
-            used+=sum(len(json.dumps(b['text'],ensure_ascii=False)) for b in value['blocks'])
-            if value['next_line']:
-                pending.append(dict(path=item['path'],start_line=value['next_line'],max_lines=item['max_lines']))
+            value.pop('version',None);value.pop('editable',None)
+            for block in value.get('blocks',[]):
+                if block.get('next_line') is None:block.pop('next_line',None)
+            if value.get('next_line') is None:value.pop('next_line',None)
+            cost=len(json.dumps(value,ensure_ascii=False,separators=(',',':')))
+            if cost>remaining:
+                pending.append(item);continue
+            results.append(value);sources.append((item,value));used+=cost
+            if value.get('next_line'):
+                entry=dict(path=item['path'],start_line=value['next_line'],max_lines=item['max_lines'])
+                pending.append(entry)
+                used+=len(json.dumps(entry,ensure_ascii=False,separators=(',',':')))
         value=dict(path=base,files=results,pending=pending,complete=not pending)
+        while results and len(json.dumps(value,ensure_ascii=False,separators=(',',':')))>a['max_chars']:
+            item,dropped=sources.pop();results.pop()
+            if dropped.get('next_line'):
+                for index,entry in enumerate(pending):
+                    if (entry.get('path')==item['path'] and entry.get('start_line')==dropped['next_line']
+                            and entry.get('max_lines')==item['max_lines']):
+                        pending.pop(index);break
+            pending.insert(0,item)
+            value=dict(path=base,files=results,pending=pending,complete=not pending)
     emit(dict(ok=True,**value))
 except Exception as error:
     emit(dict(ok=False,error=str(error)));sys.exit(1)

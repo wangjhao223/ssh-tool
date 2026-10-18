@@ -13,9 +13,29 @@ meta.update(pid=str(p), uid=os.getuid(), pgid=int(fields[2]), sid=int(fields[3])
 print('# remote-ws job-v2 ' + json.dumps(meta, ensure_ascii=True), flush=True)
 '''
 
+# Compact cursor: 32 bytes (offset, device, inode, binding digest) -> 44 base64 chars.
+CURSOR_HELPERS = r'''
+import base64, struct
+
+def encode_cursor(offset, device, inode, digest):
+    return base64.b64encode(struct.pack('>QQQ8s', offset, device, inode, digest)).decode('ascii')
+
+def decode_cursor(token):
+    try:
+        raw = base64.b64decode(token, validate=True)
+    except (TypeError, ValueError):
+        raise ValueError('游标格式无效；省略 cursor 重新读取') from None
+    if raw[:1] == b'{':
+        raise ValueError('旧格式游标已失效；省略 cursor 重新读取')
+    if len(raw) != 32:
+        raise ValueError('游标格式无效；省略 cursor 重新读取')
+    offset, device, inode, digest = struct.unpack('>QQQ8s', raw)
+    return offset, device, inode, digest
+'''
+
 # Reuse canonical path and secure descriptor helpers from the file tools.
-REMOTE_SOURCE = file_tools.REMOTE_SOURCE.split('def operation(a):', 1)[0] + r'''
-import re, time, signal, select, datetime, base64
+REMOTE_SOURCE = file_tools.REMOTE_SOURCE.split('def operation(a):', 1)[0] + CURSOR_HELPERS + r'''
+import re, time, signal, select, datetime
 signals_sent = False
 
 def proc(pid):
@@ -73,18 +93,20 @@ def log_record(path):
         f.close()
         os.close(parent)
 
+def cursor_digest(a,p):
+    if a.get('query') or a.get('errors'):
+        parts=[a['source_server'],p,a.get('query'),bool(a.get('errors')),a['context_lines']]
+    else:
+        parts=[a['source_server'],p,None,False]
+    return hashlib.sha256(json.dumps(parts,ensure_ascii=False).encode()).digest()[:8]
+
 def filtered_tail(a,p,parent,f,before):
-    fingerprint=hashlib.sha256(json.dumps([a.get('query'),a.get('errors'),a['context_lines']],ensure_ascii=False).encode()).hexdigest()[:16]
+    digest=cursor_digest(a,p)
     if a.get('cursor'):
-        try:
-            token=json.loads(base64.b64decode(a['cursor'],validate=True))
-            if (token.get('server')!=a['source_server'] or token.get('path')!=p or token.get('device')!=before.st_dev or
-                token.get('inode')!=before.st_ino or token.get('filter')!=fingerprint or
-                type(token.get('offset')) is not int or not 0<=token['offset']<=before.st_size):
-                raise ValueError()
-            start=token['offset']
-        except (ValueError,TypeError,AttributeError):
+        offset,device,inode,bound=decode_cursor(a['cursor'])
+        if device!=before.st_dev or inode!=before.st_ino or bound!=digest or not 0<=offset<=before.st_size:
             raise ValueError('游标与文件/过滤条件不符；省略 cursor 重新读取')
+        start=offset
     else:
         start=max(0,before.st_size-1024*1024)
         if start:
@@ -153,11 +175,15 @@ def filtered_tail(a,p,parent,f,before):
     path_stat=os.stat(os.path.basename(p),dir_fd=parent,follow_symlinks=False)
     if (current.st_dev,current.st_ino)!=(path_stat.st_dev,path_stat.st_ino) or current.st_size<before.st_size:
         raise ValueError('读取期间日志已替换或缩短；省略 cursor 重新读取')
-    token=base64.b64encode(json.dumps(dict(server=a['source_server'],path=p,device=before.st_dev,
-        inode=before.st_ino,offset=offset,filter=fingerprint),separators=(',',':')).encode()).decode()
-    return dict(text=''.join(pieces),cursor=token,more=cut or (offset<before.st_size and not pending and not pending_exception),
-                pending_line=pending,pending_exception=pending_exception,exception_incomplete=exception_incomplete,
-                scanned_bytes=offset-start,window_start=start,matched_blocks=returned)
+    token=encode_cursor(offset,before.st_dev,before.st_ino,digest)
+    value=dict(text=''.join(pieces),cursor=token,more=cut or (offset<before.st_size and not pending and not pending_exception))
+    if pending:value['pending_line']=True
+    if pending_exception:value['pending_exception']=True
+    if exception_incomplete:value['exception_incomplete']=True
+    if offset-start:value['scanned_bytes']=offset-start
+    if start:value['window_start']=start
+    if returned:value['matched_blocks']=returned
+    return value
 
 
 def tail_page(a):
@@ -171,15 +197,10 @@ def tail_page(a):
             return filtered_tail(a,p,parent,f,before)
         cursor = a.get('cursor')
         if cursor:
-            try:
-                value = json.loads(base64.b64decode(cursor, validate=True))
-                if (value.get('filter') is not None or value.get('server') != a['source_server'] or value.get('path') != p or
-                    value.get('device') != before.st_dev or value.get('inode') != before.st_ino or
-                    type(value.get('offset')) is not int or not 0 <= value['offset'] <= before.st_size):
-                    raise ValueError()
-                offset = value['offset']
-            except (ValueError, KeyError, TypeError):
-                raise ValueError('游标与日志不符或日志已替换/缩短；省略 cursor 重新读取')
+            offset, device, inode, bound = decode_cursor(cursor)
+            if (device != before.st_dev or inode != before.st_ino or bound != cursor_digest(a, p)
+                    or not 0 <= offset <= before.st_size):
+                raise ValueError('游标与日志/过滤条件不符或日志已替换/缩短；省略 cursor 重新读取')
         else:
             # Bound the backwards scan, including a log with no newlines.
             offset = before.st_size
@@ -223,10 +244,10 @@ def tail_page(a):
         path_stat = os.stat(os.path.basename(p), dir_fd=parent, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (path_stat.st_dev, path_stat.st_ino) or current.st_size < before.st_size:
             raise ValueError('读取期间日志已替换或缩短；省略 cursor 重新读取')
-        token = base64.b64encode(json.dumps(dict(server=a['source_server'],path=p,device=before.st_dev,
-            inode=before.st_ino,offset=offset), separators=(',',':')).encode()).decode()
-        return dict(text=''.join(pieces), cursor=token, more=offset<before.st_size and not pending,
-                    pending_line=pending)
+        token = encode_cursor(offset, before.st_dev, before.st_ino, cursor_digest(a, p))
+        value = dict(text=''.join(pieces), cursor=token, more=offset<before.st_size and not pending)
+        if pending: value['pending_line'] = True
+        return value
     finally:
         f.close()
         os.close(parent)
@@ -357,5 +378,11 @@ except Exception as error:
 
 
 def request(server, operation, **params):
-    return file_tools.remote_json(server, dict(operation=operation, roots=file_tools.roots_config(), **params),
-                                  timeout=60, source=REMOTE_SOURCE)
+    value = file_tools.remote_json(server, dict(operation=operation, roots=file_tools.roots_config(), **params),
+                                   timeout=60, source=REMOTE_SOURCE)
+    value.pop('ok', None)
+    if operation == 'tail':
+        job = params.get('job_meta') or {}
+        if job.get('job_id'):
+            value['task_id'] = job['job_id'][:12]
+    return value

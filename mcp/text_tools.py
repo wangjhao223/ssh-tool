@@ -108,18 +108,23 @@ try:
             if not same(f,p,parent,identity(s)):
                 raise ValueError('搜索期间文件发生变化，请重新搜索')
             if blocks:
-                results.append(dict(path=p,match_lines=hit_lines,sha256=hashlib.sha256(raw).hexdigest() if s.st_size<=LIMIT else None,
-                                    blocks=blocks))
+                hit=dict(path=p,match_lines=hit_lines,blocks=blocks)
+                if a.get('include_sha256'):
+                    hit['sha256']=hashlib.sha256(raw).hexdigest() if s.st_size<=LIMIT else None
+                results.append(hit)
         except (PermissionError, FileNotFoundError):
             skipped['unreadable']+=1
         finally:
             if f: f.close()
             if parent is not None: os.close(parent)
         if reason: break
-    emit(dict(ok=True,path=root,files=results,matches=matches,scanned_bytes=used_bytes,
-              scanned_entries=entries_seen,skipped=skipped,
-              incomplete=bool(reason or skipped['oversized'] or skipped['unreadable'] or skipped['symlink']),
-              reason=reason))
+    incomplete=bool(reason or skipped['oversized'] or skipped['unreadable'])
+    value=dict(ok=True,path=root,files=results,matches=matches)
+    if any(skipped.values()): value['skipped']=skipped
+    if incomplete:
+        value.update(incomplete=True,scanned_bytes=used_bytes,scanned_entries=entries_seen)
+        if reason: value['reason']=reason
+    emit(value)
 except Exception as error:
     emit(dict(ok=False,error=str(error)))
     sys.exit(1)
@@ -135,9 +140,12 @@ def search_text(args):
         raise file_tools.FileToolError('file_glob 必须是文件名通配符，如 *.py')
     if type(sensitive) is not bool:
         raise file_tools.FileToolError('case_sensitive 必须是布尔值')
+    include_sha256=args.get('include_sha256',False)
+    if type(include_sha256) is not bool:
+        raise file_tools.FileToolError('include_sha256 必须是布尔值')
     roots=file_tools.roots_config()
     payload=dict(operation='search',roots=roots,path=file_tools.request_path(args.get('path'),roots),
-                 query=query,file_glob=pattern,case_sensitive=sensitive,
+                 query=query,file_glob=pattern,case_sensitive=sensitive,include_sha256=include_sha256,
                  context_lines=file_tools.integer(args,'context_lines',2,0,10),
                  limit=file_tools.integer(args,'limit',20,1,100),
                  max_chars=file_tools.integer(args,'max_chars',6000,256,12000))
@@ -149,10 +157,11 @@ def search_text(args):
     return text
 
 def tools():
-    return [('search_text',search_text,'目录/文件字面搜索，默认 20 处及上下各 2 行；incomplete 表示未完整覆盖。',
+    return [('search_text',search_text,'目录/文件字面搜索，默认 20 处及上下各 2 行；incomplete 表示未完整覆盖；sha256 用于版本核对，默认不返回。',
         dict(type='object',required=['path','query'],additionalProperties=False,properties=dict(
             path={'type':'string'},query={'type':'string'},server={'type':'string','description':local_connection.server_arg_desc()},file_glob={'type':'string','default':'*'},
             context_lines={'type':'integer','minimum':0,'maximum':10,'default':2},
             limit={'type':'integer','minimum':1,'maximum':100,'default':20},
             max_chars={'type':'integer','minimum':256,'maximum':12000,'default':6000},
-            case_sensitive={'type':'boolean','default':True}))) ]
+            case_sensitive={'type':'boolean','default':True},
+            include_sha256={'type':'boolean','default':False}))) ]

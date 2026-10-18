@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 CONF_FILE = os.path.join(HERE, "remote-ws.conf")
 SSH_CONFIG = os.path.join(HERE, "ssh_config")
 HOST_PREFIX = "srv-"
-CONNECT_SCRIPT = os.path.join(os.path.dirname(HERE), "scripts", "connect.sh")
+CONNECT_SCRIPT = "scripts/connect.sh"
 MAX_OUTPUT = 30000
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -100,12 +100,14 @@ def remote_dir(cwd):
     return c["CODE_ROOT"] + "/" + cwd
 
 
-def truncate(text):
-    if len(text) <= MAX_OUTPUT:
+def truncate(text, limit=MAX_OUTPUT):
+    if len(text) <= limit:
         return text
-    head = MAX_OUTPUT // 3
-    tail = MAX_OUTPUT - head
-    return text[:head] + f"\n\n... [省略 {len(text) - MAX_OUTPUT} 字符；如需完整输出，请重定向到文件后用 tail_log 或 head/tail 分段查看] ...\n\n" + text[-tail:]
+    marker = f"\n…[截断 {len(text) - limit} 字符，可重定向到文件分段读]…\n"
+    available = max(0, limit - len(marker))
+    head = available // 3
+    tail = available - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
 
 
 def connect_cmd(name):
@@ -113,9 +115,13 @@ def connect_cmd(name):
 
 
 def not_connected_hint(name):
-    return (f"无法免密连接 {HOST_PREFIX}{name}。可调用 connect(server=\"{name}\") 打开本地登录窗口，"
-            f"或把下面的命令原样交给用户在 WSL 终端执行:\n  {connect_cmd(name)}\n"
-            f"输入一次服务器密码（连接空闲 8 小时后断开）后再重试。不要索要、保存或处理密码。")
+    return (f"未连接 {HOST_PREFIX}{name}。用 connect(server=\"{name}\") 弹窗，"
+            f"或 WSL 运行 {connect_cmd(name)}。")
+
+
+def default_server():
+    default = (conf().get("DEFAULT_SERVER") or "").strip()
+    return default[len(HOST_PREFIX):] if default.startswith(HOST_PREFIX) else default
 
 
 # ---------------------------------------------------------------- write guard
@@ -452,10 +458,9 @@ def find_write_violations(command, cwd, conda_env):
 
 
 def confirm_text(viol):
-    lines = ["检测到写/修改操作落在受保护区域（/home/wjh、/data/wjh 及 /tmp、/var/tmp、/dev/shm）之外："]
-    lines += ["  - " + v for v in viol]
-    lines.append("请先向用户说明这些操作并征得明确同意，然后用完全相同的参数重试并加 confirmed=true。")
-    return "\n".join(lines)
+    shown = "；".join(viol[:5])
+    more = f" 等 {len(viol)} 处" if len(viol) > 5 else ""
+    return f"越界写需用户同意：{shown}{more}\n同意后同参重试并加 confirmed=true。"
 
 
 class LimitedText:
@@ -537,27 +542,35 @@ def ssh_run(name, script, timeout, max_output_chars=None):
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace") + (e.stderr or b"").decode("utf-8", "replace")
         raise ToolError(
-            f"命令超过 {timeout}s 未结束，本地已断开（服务器上的进程可能仍在运行）。"
-            f"执行状态不确定，不得自动重跑；先检查任务状态。长任务请改用 run_background。已收到的输出:\n{truncate(out)}")
+            f"超过 {timeout}s 未结束，状态不确定：先查 jobs/tail_log，勿重跑；长任务用 run_background。"
+            f"已收到的输出:\n{truncate(out)}")
     if rc == 255:
         classified = local_connection.classify_ssh_error(err)
         if classified:
             code, summary = classified
             extra = (not_connected_hint(name) if code == "authentication_failed" else
-                     f"请调用 diagnose(server=\"{name}\") 检查；本次命令执行状态不确定，不自动重新登录或重跑命令。")
+                     f"请调用 diagnose(server=\"{name}\") 检查。")
             raise ToolError(f"[{code}] {summary}\n{extra}\n"
                             + fmt_result(rc, out, err, time.time() - start))
     return rc, out, err, time.time() - start
 
 
-def env_prelude(conda_env, gpus):
+def env_prelude(conda_env, gpus, server=None):
     c = conf()
     lines = []
     if conda_env:
         if not NAME_RE.match(conda_env):
             raise ToolError(f"非法 conda 环境名: {conda_env}")
-        lines.append(f"source {qpath(c['CONDA_ROOT'])}/bin/activate {shlex.quote(conda_env)} || "
-                     f"{{ echo 'remote-ws: conda 环境 {conda_env} 激活失败' >&2; exit 98; }}")
+        init = c.get("CONDA_INIT_" + (server or "").upper())
+        if init:
+            # 系统预装 anaconda（如 a100 的 /opt/acd）：先初始化再 source activate
+            lines.append(f"source {qpath(init)} || "
+                         f"{{ echo 'remote-ws: conda 初始化失败: {init}' >&2; exit 98; }}")
+            lines.append(f"source activate {shlex.quote(conda_env)} || "
+                         f"{{ echo 'remote-ws: conda 环境 {conda_env} 激活失败' >&2; exit 98; }}")
+        else:
+            lines.append(f"source {qpath(c['CONDA_ROOT'])}/bin/activate {shlex.quote(conda_env)} || "
+                         f"{{ echo 'remote-ws: conda 环境 {conda_env} 激活失败' >&2; exit 98; }}")
     if gpus is not None and str(gpus).strip() != "":
         g = str(gpus).strip()
         if not re.match(r"^\d+(,\d+)*$", g):
@@ -567,13 +580,17 @@ def env_prelude(conda_env, gpus):
 
 
 def fmt_result(rc, out, err, elapsed, extra=""):
-    parts = [f"exit_code: {rc}   耗时: {elapsed:.1f}s{extra}"]
-    if rc:
-        parts.append("远程命令返回非零退出码，请检查命令输出；不会因此重新登录或自动重跑。")
+    out, err = out.rstrip("\n"), err.rstrip("\n")
+    limits = (MAX_OUTPUT, MAX_OUTPUT)
+    if len(out) + len(err) > MAX_OUTPUT:
+        limits = (MAX_OUTPUT - min(len(err), MAX_OUTPUT // 2),
+                  MAX_OUTPUT - min(len(out), MAX_OUTPUT // 2))
+    parts = [f"exit_code: {rc}" + (f"   耗时: {elapsed:.1f}s" if elapsed >= 5 else "") + extra]
     if out:
-        parts.append("--- stdout ---\n" + truncate(out.rstrip("\n")))
+        body = truncate(out, limits[0])
+        parts.append("--- stdout ---\n" + body if err else body)
     if err:
-        parts.append("--- stderr ---\n" + truncate(err.rstrip("\n")))
+        parts.append("--- stderr ---\n" + truncate(err, limits[1]))
     if not out and not err:
         parts.append("(无输出)")
     return "\n".join(parts)
@@ -656,10 +673,11 @@ def t_exec(args):
         raise ToolError(confirm_text(viol))
     script = "\n".join(
         [f"cd {qpath(rdir)} || {{ echo 'remote-ws: 目录不存在: {rdir}' >&2; exit 97; }}"]
-        + env_prelude(args.get("conda_env"), args.get("gpus"))
+        + env_prelude(args.get("conda_env"), args.get("gpus"), name)
         + [command])
     rc, out, err, el = ssh_run(name, script, timeout, max_output_chars=cap)
-    text = fmt_result(rc, out, err, el, f"   服务器: {name}   目录: {rdir}")
+    extra = f"   服务器: {name}" if name != default_server() else ""
+    text = fmt_result(rc, out, err, el, extra)
     if viol:
         text = f"⚠️ 用户已确认越界写操作: {'；'.join(viol)}\n" + text
     return text, rc != 0
@@ -687,7 +705,7 @@ def t_run_background(args):
     viol = find_write_violations(command, rdir, args.get("conda_env"))
     if viol and args.get("confirmed") is not True:
         raise ToolError(confirm_text(viol))
-    inner = "\n".join(env_prelude(args.get("conda_env"), args.get("gpus")) + [command])
+    inner = "\n".join(env_prelude(args.get("conda_env"), args.get("gpus"), name) + [command])
     job_id = uuid.uuid4().hex
     meta = json.dumps(dict(job_id=job_id, name=job, cwd=rdir,
                           conda_env=args.get('conda_env') or '-', gpus=args.get('gpus') or '-'))
@@ -707,7 +725,7 @@ def t_run_background(args):
         "if kill -0 $pid 2>/dev/null; then st=running; else st=exited; fi\n"
         "echo \"pid=$pid status=$st log=$log\"\n"
         )
-    rc, out, err, el = ssh_run(name, script, 60)
+    rc, out, err, el = ssh_run(name, script, 60, max_output_chars=6000)
     stamp = f"⚠️ 用户已确认越界写操作: {'；'.join(viol)}\n" if viol else ""
     if rc != 0:
         return stamp + fmt_result(rc, out, err, el), True
@@ -728,8 +746,12 @@ def t_jobs(args):
         return f"{name} 上没有 run_background 启动过的任务（扫描 DATA_ROOT/logs 和 DATA_ROOT/*/logs）。"
     lines = [f"{name} 上的后台任务（新→旧）:"]
     for j in jobs:
-        detail = (f" start={j['start']} last_write={j['last_write']} gpus={j['gpus']} env={j['conda_env']}" if verbose else '')
-        lines.append(f"- {j['name']} [{j['status']}] id={j.get('job_id') or 'legacy'} pid={j['pid']}{detail}\n  log: {j['log']}")
+        if verbose:
+            detail = f" start={j['start']} last_write={j['last_write']} gpus={j['gpus']} env={j['conda_env']}"
+            lines.append(f"- {j['name']} [{j['status']}] id={j.get('job_id') or 'legacy'} pid={j['pid']}{detail}\n  log: {j['log']}")
+        else:
+            jid = (j.get('job_id') or 'legacy')[:12]
+            lines.append(f"{j['name']} [{j['status']}] id={jid} pid={j['pid']} log={os.path.basename(j['log'])}")
     return truncate("\n".join(lines))
 
 
@@ -743,6 +765,12 @@ def find_job(name, job):
     for j in jobs:
         if j["name"] == job or os.path.basename(j["log"]) == job or j["pid"] == job or j.get('job_id') == job:
             return j
+    if len(job) == 12:
+        matches = [j for j in jobs if (j.get('job_id') or '').startswith(job)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise ToolError(f"任务 id 前缀 '{job}' 匹配到 {len(matches)} 个任务，请改用完整 id 或日志路径。")
     raise ToolError(f"在 {name} 上找不到任务 '{job}'。先用 jobs 查看。")
 
 
@@ -766,8 +794,10 @@ def t_tail_log(args):
     result = job_tools.request(name, 'tail', log=j['log'], lines=lines, max_chars=cap,
                               cursor=cursor, source_server=name, job_meta=j if j.get('identity_version') == 2 else None,
                               query=query,errors=errors,context_lines=context)
-    return json.dumps(dict(task_id=j.get('job_id'), status=j['status'], **result),
-                      ensure_ascii=False, separators=(',', ':'))
+    result.pop("ok", None)
+    result.setdefault("task_id", (j.get("job_id") or "")[:12])
+    result["status"] = j["status"]
+    return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
 
 
 def t_stop_job(args):
@@ -778,7 +808,12 @@ def t_stop_job(args):
     if j["status"] != "running" or not j.get("pid"):
         return f"任务 {j.get('name')} 当前不在运行（{j['status']}），无需停止。"
     result = job_tools.request(name, 'stop', log=j['log'], expected=j, force=args.get('force') is True)
-    return json.dumps(result, ensure_ascii=False)
+    result.pop("ok", None)
+    sent = result.get("signalled_pids") or []
+    remaining = result.get("remaining_pids") or []
+    result["message"] = (f"已核实身份并停止 {len(sent)} 个进程"
+                         + (f"，剩余 {len(remaining)} 个仍在运行" if remaining else ""))
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 GPU_SCRIPT = r"""
@@ -794,7 +829,7 @@ done
 
 def t_gpus(args):
     name, _ = resolve_server(args.get("server"))
-    rc, out, err, el = ssh_run(name, GPU_SCRIPT, 60)
+    rc, out, err, el = ssh_run(name, GPU_SCRIPT, 60, max_output_chars=6000)
     if rc != 0:
         return fmt_result(rc, out, err, el), True
     gpu_part, _, app_part = out.partition("@@APPS")
@@ -802,20 +837,25 @@ def t_gpus(args):
     for line in app_part.strip().splitlines():
         f = line.split("\t")
         if len(f) == 4:
-            apps.setdefault(f[0].strip(), []).append(f"{f[3].split()[0]}(pid {f[1]}, {f[2]}MiB, {f[3].split()[-1]})")
-    lines = [f"{name} GPU 状态:"]
-    free = []
+            apps.setdefault(f[0].strip(), []).append(f[3].split()[0])
+    rows, free = [], []
     for line in gpu_part.strip().splitlines():
         f = [x.strip() for x in line.split(",")]
         if len(f) < 6:
             continue
         idx, uuid, gname, used, total, util = f[:6]
-        procs = apps.get(uuid, [])
-        is_free = not procs and int(float(used)) < 1000
+        owners = sorted(set(apps.get(uuid, [])))
+        is_free = not owners and int(float(used)) < 1000
         if is_free:
             free.append(idx)
-        lines.append(f"  GPU {idx} {gname}  显存 {used}/{total} MiB  利用率 {util}%  "
-                     f"{'空闲' if is_free else '占用: ' + (', '.join(procs) or '未知进程')}")
+        rows.append((idx, gname, used, total, util, is_free, owners))
+    lines = [f"{name} GPU 状态:"]
+    for gname in dict.fromkeys(r[1] for r in rows):
+        group = [r for r in rows if r[1] == gname]
+        lines.append(f"  {len(group)}×{gname}")
+        for idx, _, used, total, util, is_free, owners in group:
+            state = "空闲" if is_free else "占用: " + (", ".join(owners) or "未知进程")
+            lines.append(f"    GPU {idx}  显存 {used}/{total} MiB  利用率 {util}%  {state}")
     lines.append(f"空闲 GPU: {','.join(free) if free else '无'}（用法: gpus=\"{','.join(free[:1]) or '0'}\"）")
     return "\n".join(lines)
 
@@ -823,15 +863,31 @@ def t_gpus(args):
 def t_conda_envs(args):
     name, _ = resolve_server(args.get("server"))
     c = conf()
-    script = (f"{qpath(c['CONDA_ROOT'])}/bin/conda env list || exit 1\n"
-              f"for e in {qpath(c['CONDA_ROOT'])} {qpath(c['CONDA_ROOT'])}/envs/*; do\n"
-              "  [ -x \"$e/bin/python\" ] || continue\n"
-              "  v=$(\"$e/bin/python\" -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])' 2>/dev/null)\n"
-              "  t=$(\"$e/bin/python\" -c 'import torch;print(torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null || echo '无 torch')\n"
-              "  n=$(basename \"$e\"); [ \"$e\" = " + qpath(c['CONDA_ROOT']) + " ] && n=base\n"
-              "  echo \"$n: python $v, torch: $t\"\n"
-              "done\n")
-    rc, out, err, el = ssh_run(name, script, 120)
+    init = c.get("CONDA_INIT_" + name.upper())
+    if init:
+        # 系统预装 anaconda（如 a100 的 /opt/acd）：source 初始化后用 PATH 上的 conda；
+        # 用户 conda create -n 建的环境在 ~/.conda/envs
+        script = (f"source {qpath(init)} || exit 1\n"
+                  "conda env list || exit 1\n"
+                  "v=$(python -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])' 2>/dev/null)\n"
+                  "t=$(python -c 'import torch;print(torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null || echo '无 torch')\n"
+                  "echo \"base: python $v, torch: $t\"\n"
+                  "for e in \"$HOME\"/.conda/envs/*/; do\n"
+                  "  [ -x \"$e/bin/python\" ] || continue\n"
+                  "  v=$(\"$e/bin/python\" -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])' 2>/dev/null)\n"
+                  "  t=$(\"$e/bin/python\" -c 'import torch;print(torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null || echo '无 torch')\n"
+                  "  echo \"$(basename \"$e\"): python $v, torch: $t\"\n"
+                  "done\n")
+    else:
+        script = (f"{qpath(c['CONDA_ROOT'])}/bin/conda env list || exit 1\n"
+                  f"for e in {qpath(c['CONDA_ROOT'])} {qpath(c['CONDA_ROOT'])}/envs/*; do\n"
+                  "  [ -x \"$e/bin/python\" ] || continue\n"
+                  "  v=$(\"$e/bin/python\" -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])' 2>/dev/null)\n"
+                  "  t=$(\"$e/bin/python\" -c 'import torch;print(torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null || echo '无 torch')\n"
+                  "  n=$(basename \"$e\"); [ \"$e\" = " + qpath(c['CONDA_ROOT']) + " ] && n=base\n"
+                  "  echo \"$n: python $v, torch: $t\"\n"
+                  "done\n")
+    rc, out, err, el = ssh_run(name, script, 120, max_output_chars=6000)
     return fmt_result(rc, out, err, el), rc != 0
 
 
@@ -844,15 +900,13 @@ def t_init_project(args):
     code = f"{c['CODE_ROOT']}/{project}"
     data = f"{c['DATA_ROOT']}/{project}"
     subdirs = " ".join(f"{qpath(data)}/{d}" for d in ("data", "checkpoints", "results", "logs"))
-    script = (f"mkdir -p {qpath(code)} {subdirs} || exit 1\n"
-              f"ls -ld {qpath(code)} {qpath(data)} {subdirs}\n")
-    rc, out, err, el = ssh_run(name, script, 60)
+    script = f"mkdir -p {qpath(code)} {subdirs} || exit 1\n"
+    rc, out, err, el = ssh_run(name, script, 60, max_output_chars=6000)
     if rc != 0:
         return fmt_result(rc, out, err, el), True
-    return (f"已在 {name} 上创建项目 {project}:\n"
-            f"  代码:   {code}\n"
-            f"  数据:   {data}/data\n  权重:   {data}/checkpoints\n  结果:   {data}/results\n  日志:   {data}/logs\n\n"
-            + out.strip()), False
+    return (f"已创建项目 {project}（{name}）\n"
+            f"代码: {code}\n"
+            f"数据: {data}（data/checkpoints/results/logs）")
 
 
 S = {"type": "string"}
@@ -862,7 +916,6 @@ SERVER_ARG = {"type": "string", "description": local_connection.server_arg_desc(
 CWD_ARG = {"type": "string", "description": "远端目录，默认/相对 CODE_ROOT，支持 ~/"}
 ENV_ARG = {"type": "string", "description": "已有 Conda 环境；省略用系统环境"}
 GPU_ARG = {"type": "string", "description": "CUDA_VISIBLE_DEVICES，如 0,1；先查 gpus"}
-CONFIRMED_ARG = {"type": "boolean", "description": "越界写已获用户明确同意；仅同参重试"}
 VERBOSE_ARG = {"type": "boolean", "default": False, "description": "返回详情"}
 
 TOOLS = [
@@ -873,24 +926,24 @@ TOOLS = [
       "timeout_sec": {"type": "integer", "description": "诊断连接超时秒数，默认 3，最大 10"}}}),
     ("status", t_status, "只查本地 socket/登录锁，不访问网络；session_present 不保证链路正常。",
      {"type": "object", "properties": {"server": SERVER_ARG, "all":{"type":"boolean","default":False}, "verbose": VERBOSE_ARG}}),
-    ("exec", t_exec, "远端短 Bash，返回退出码及输出；越界写须获准后同参加 confirmed。",
+    ("exec", t_exec, "远端短 Bash，返回退出码及输出；越界写须获准后同参 confirmed=true 重试。",
      {"type": "object", "properties": {"command": {**S, "description": "要执行的 bash 命令"}, "server": SERVER_ARG, "cwd": CWD_ARG,
       "conda_env": ENV_ARG, "gpus": GPU_ARG, "timeout_sec": {"type": "integer", "description": "超时秒数，默认 120，最大 1800"},
-      "confirmed": CONFIRMED_ARG, "max_output_chars":{"type":"integer","minimum":256,"maximum":30000,"default":6000}},
+      "max_output_chars":{"type":"integer","minimum":256,"maximum":30000,"default":6000}},
       "required": ["command"]}),
     ("run_background", t_run_background, "后台长任务，返回 ID/PID/状态/日志；日志进 DATA_ROOT，越界写保护同 exec。",
      {"type": "object", "properties": {"command": {**S, "description": "要执行的命令，如 python train.py --epochs 100"},
       "name": {**S, "description": "任务名，字母数字_.-"}, "project": {**S, "description": "日志项目名"},
-      "server": SERVER_ARG, "cwd": CWD_ARG, "conda_env": ENV_ARG, "gpus": GPU_ARG, "confirmed": CONFIRMED_ARG}, "required": ["command", "name"]}),
-    ("jobs", t_jobs, "列后台任务及核实状态，默认 10 项；verbose 查时间/GPU/环境。",
+      "server": SERVER_ARG, "cwd": CWD_ARG, "conda_env": ENV_ARG, "gpus": GPU_ARG}, "required": ["command", "name"]}),
+    ("jobs", t_jobs, "列后台任务（name/状态/12位id/pid/日志名），默认 10 项；verbose 查时间/GPU/环境。",
      {"type": "object", "properties": {"server": SERVER_ARG, "limit": {"type": "integer", "description": "默认 10，最大 500"}, "verbose": VERBOSE_ARG}}),
     ("tail_log", t_tail_log, "日志续读；query 过滤，errors 保留异常块。cursor 绑定条件，more 表示需续读。",
-     {"type": "object", "properties": {"job": {**S, "description": "ID/名称/PID/日志路径，同名最新"},
+     {"type": "object", "properties": {"job": {**S, "description": "ID或12位前缀/名称/PID/日志路径，同名最新"},
       "lines": {"type": "integer", "description": "默认 20，最大 2000"}, "cursor": S,
       "max_chars":{"type":"integer","minimum":256,"maximum":12000,"default":6000}, "server": SERVER_ARG,
       "query":S,"errors":{"type":"boolean","default":False},"context_lines":{"type":"integer","minimum":0,"maximum":10,"default":2}}, "required": ["job"]}),
     ("stop_job", t_stop_job, "核实身份后停止组成员；旧日志/身份不符拒绝，force 用 SIGKILL。",
-     {"type": "object", "properties": {"job": {**S, "description": "ID/名称/PID/日志路径"}, "force": {"type": "boolean"}, "server": SERVER_ARG},
+     {"type": "object", "properties": {"job": {**S, "description": "ID或12位前缀/名称/PID/日志路径"}, "force": {"type": "boolean"}, "server": SERVER_ARG},
       "required": ["job"]}),
     ("gpus", t_gpus, "查显存/利用率/进程属主和空闲卡；用 GPU 前调用。",
      {"type": "object", "properties": {"server": SERVER_ARG}}),
@@ -909,7 +962,7 @@ TOOL_MAP = {name: fn for name, fn, _, _ in TOOLS}
 # ---------------------------------------------------------------- JSON-RPC
 
 def send(msg):
-    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
@@ -922,7 +975,7 @@ def handle(req):
         return {"protocolVersion": v if v in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": "Project SSH only. Install nothing remotely; never handle passwords or other users' files. After uncertain execution, inspect state before retrying. Out-of-root writes need user consent and identical confirmed arguments. Check gpus before GPU use; run_background for long jobs. Diagnose connection failures. get_guide(topic) gives local help/config; read only needed topics. server defaults to DEFAULT_SERVER; paths use configured roots. Summaries are default; verbose returns details."}
+                "instructions": "不安装/部署服务器组件；密码只在登录窗口由用户输入，不索要不保存；越界写须用户同意后同参 confirmed=true 重试；超时/断线后状态不确定，先查 jobs/tail_log 勿自动重跑；长任务用 run_background。"}
     if method == "ping":
         return {}
     if method == "tools/list":

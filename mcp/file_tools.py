@@ -98,7 +98,7 @@ def identity(s):
                 mtime_ns=s.st_mtime_ns, ctime_ns=s.st_ctime_ns)
 
 def meta(s):
-    return dict(identity(s), modified_time=s.st_mtime, mode=stat.S_IMODE(s.st_mode))
+    return dict(size=s.st_size, mtime_ns=s.st_mtime_ns)
 
 def same(f, p, parent, before):
     return identity(os.fstat(f.fileno())) == before and identity(os.stat(os.path.basename(p), dir_fd=parent, follow_symlinks=False)) == before
@@ -125,7 +125,10 @@ def operation(a):
             for name in names[offset:offset + limit]:
                 s = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 kind = 'symlink' if stat.S_ISLNK(s.st_mode) else 'directory' if stat.S_ISDIR(s.st_mode) else 'file' if stat.S_ISREG(s.st_mode) else 'other'
-                item = dict(name=name, type=kind, size=s.st_size, modified_time=s.st_mtime)
+                item = dict(name=name, type=kind)
+                if kind != 'directory':
+                    item['size'] = s.st_size
+                item['modified_time'] = int(s.st_mtime)
                 if any(under(p, r) for r in roots[2:]) and s.st_uid != os.getuid():
                     item = dict(name=name, type='restricted')
                 cost = len(json.dumps(item, ensure_ascii=False))
@@ -170,7 +173,7 @@ def operation(a):
                 f.seek(0)
             result['editable'] = s.st_size <= LIMIT and s.st_uid == os.getuid() and s.st_nlink == 1
             ranges = a['ranges']
-            blocks = [dict(start_line=r['start_line'],text='',next_line=None) for r in ranges]
+            blocks = [dict(start_line=r['start_line'],text='') for r in ranges]
             lines, number, used, range_index, exhausted = [], 0, 0, 0, False
             next_line = None
             while True:
@@ -183,7 +186,6 @@ def operation(a):
                 if range_index==len(ranges):
                     if not a['multi_range']:
                         next_line=number
-                        blocks[0]['next_line']=number
                     break
                 if number < ranges[range_index]['start_line']:
                     if len(raw) > CAP * 4:
@@ -197,11 +199,13 @@ def operation(a):
                 if cost > a['max_chars']:
                     if not used:
                         raise ValueError('超长单行，请下载查看')
-                    blocks[range_index]['next_line'] = number
+                    if a['multi_range']:
+                        blocks[range_index]['next_line'] = number
                     next_line,exhausted = number,True
                     break
                 if used + cost > a['max_chars']:
-                    blocks[range_index]['next_line'] = number
+                    if a['multi_range']:
+                        blocks[range_index]['next_line'] = number
                     next_line,exhausted = number,True
                     break
                 lines.append(item)
@@ -250,7 +254,8 @@ def operation(a):
                     new_preview=new[:4096].splitlines(keepends=True)[:100]
                     if len(old)>4096 or len(new)>4096 or old.count('\n')>100 or new.count('\n')>100:
                         preview_truncated=True
-                    for line in difflib.unified_diff(old_preview,new_preview,fromfile='old',tofile='new',n=2):
+                    for index,line in enumerate(difflib.unified_diff(old_preview,new_preview,fromfile='old',tofile='new',n=1)):
+                        if index<2: continue
                         if not line.endswith('\n'): line+='\n'
                         cost=len(json.dumps(line,ensure_ascii=False))
                         if preview_used+cost>a['max_chars']:
@@ -276,7 +281,7 @@ def operation(a):
             published = True
             temporary = None
             os.fsync(parent)
-            result=dict(path=p, sha256=hashlib.sha256(data).hexdigest(), size=len(data), edited=True)
+            result=dict(path=p, sha256=hashlib.sha256(data).hexdigest(), size=len(data))
             if a['include_diff']:
                 result.update(diff=''.join(preview),change_lines=positions,diff_truncated=preview_truncated)
             return result
@@ -389,6 +394,7 @@ def remote_json(server, payload, timeout=120, source=None):
             message += ('；停止可能已部分执行，请查询 jobs 确认，不自动重复停止'
                         if payload['operation'] == 'stop' else '；编辑可能已写入，请重新读取确认，不自动重写')
         raise FileToolError(message)
+    value.pop('ok', None)
     return value
 
 
@@ -403,7 +409,7 @@ def file_call(operation, args):
     roots = roots_config()
     payload = dict(operation=operation, roots=roots, path=request_path(args.get('path'), roots))
     if operation == 'list':
-        payload.update(offset=integer(args, 'offset', 0, 0, 2**63-1), limit=integer(args, 'limit', 100, 1, 1000))
+        payload.update(offset=integer(args, 'offset', 0, 0, 2**63-1), limit=integer(args, 'limit', 50, 1, 1000))
     elif operation == 'read':
         compact=args.get('compact',True)
         if type(compact) is not bool:
@@ -438,9 +444,8 @@ def file_call(operation, args):
         if type(include) is not bool:
             raise FileToolError('include_diff 必须是布尔值')
         payload.update(edits=edits,expected_sha256=digest.lower(),include_diff=include,
-                       max_chars=integer(args,'max_chars',2000,256,6000))
+                       max_chars=integer(args,'max_chars',1000,256,6000))
     value = remote_json(connection.resolve_server(args.get('server')), payload)
-    value.pop('ok',None)
     text = json.dumps(value, ensure_ascii=False,separators=(',',':'))
     if len(text) > MAX_TEXT:
         raise FileToolError('元数据或输出过长，请缩小分页范围')
@@ -538,8 +543,8 @@ def verbosity(args):
 
 SUMMARY_KEYS = ('task_id','server','remote_path','state','phase','downloaded_bytes','total_size','progress',
                 'verified_bytes','verification_progress','speed_bytes_sec','eta_sec','local_path','windows_path','sha256')
-# Task rows are a narrower view: no byte/hash detail, always able to carry message.
-ROW_KEYS = tuple(k for k in SUMMARY_KEYS if k not in ('verified_bytes','sha256')) + ('message',)
+# Task rows are a narrow view: id/status/progress only; error message stays.
+ROW_KEYS = ('task_id','server','remote_path','state','progress')
 
 
 def report_state(state, verbose=False):
@@ -564,6 +569,12 @@ def report_state(state, verbose=False):
         result = {key: result[key] for key in SUMMARY_KEYS if key in result}
         if state['state'] in ('interrupted', 'cancelled') and state.get('message'):
             result['message'] = state['message']
+    result = {key: value for key, value in result.items() if value is not None}
+    if state['state'] == result.get('phase'):
+        result.pop('phase', None)
+    if (state['state'] == 'completed' and size is not None
+            and result.get('verified_bytes') == size):
+        result.pop('verified_bytes', None)
     return result
 
 
@@ -593,7 +604,10 @@ def list_downloads(args):
     for state in records[offset:offset+limit]:
         row = report_state(state, verbose)
         keys = ROW_KEYS + (('created_at','updated_at') if verbose else ())
-        rows.append({k: row[k] for k in keys if k in row})
+        projected = {k: row[k] for k in keys if k in row}
+        if state['state'] in ('interrupted', 'cancelled') and row.get('message'):
+            projected['message'] = row['message']
+        rows.append(projected)
         if len(json.dumps(rows, ensure_ascii=False)) > MAX_TEXT - 2000:
             rows.pop()
             break
@@ -938,7 +952,7 @@ def tools():
     def schema(properties, required):
         return dict(type='object', properties=properties, required=required, additionalProperties=False)
     return [
-        ('list_files', lambda a: file_call('list', a), '列目录，不递归；默认 100 项，next_offset 续读。',
+        ('list_files', lambda a: file_call('list', a), '列目录，不递归；默认 50 项，next_offset 续读。',
          schema(dict(path=path, server=server, offset={'type':'integer','minimum':0}, limit={'type':'integer','minimum':1,'maximum':1000}), ['path'])),
         ('read_file', lambda a: file_call('read', a), '读 UTF-8 局部，默认 200 行/6000 字符；blocks 紧凑文本，ranges 多段，保留 SHA-256。',
          schema(dict(path=path,server=server,start_line={'type':'integer','minimum':1},max_lines={'type':'integer','minimum':1,'maximum':1000},
@@ -947,12 +961,12 @@ def tools():
         ('edit_file', lambda a: file_call('edit', a), 'SHA-256 核对且原文本唯一匹配后原子替换；默认返回短 diff，不代替功能验证。',
          schema(dict(path=path,server=server,expected_sha256=string,
              edits={'type':'array','minItems':1,'maxItems':100,'items':schema(dict(old_text=string,new_text=string), ['old_text','new_text'])},
-             include_diff={'type':'boolean','default':True},max_chars={'type':'integer','minimum':256,'maximum':6000,'default':2000}), ['path','edits','expected_sha256'])),
+             include_diff={'type':'boolean','default':True},max_chars={'type':'integer','minimum':256,'maximum':6000,'default':1000}), ['path','edits','expected_sha256'])),
         ('download_file', download_file, '后台单文件下载到本地 downloads/，返回 task_id；一项并发，不覆盖。',
          schema(dict(remote_path=path, server=server, local_path=string), ['remote_path'])),
-        ('download_status', download_status, '查阶段/进度/路径；仅 completed 为完成。默认摘要，verbose 查详情。',
+        ('download_status', download_status, '查阶段/进度/路径；仅 completed 为完成。默认摘要省略空值和重复字段，verbose 查详情。',
          schema(dict(task_id=string, wait_sec={'type':'integer','minimum':0,'maximum':10},verbose=verbose), ['task_id'])),
-        ('list_downloads', list_downloads, '本地找回任务 ID，新到旧；默认 10 项，next_offset 续读，无网络。',
+        ('list_downloads', list_downloads, '本地找回任务 ID，新到旧；默认 10 项，只含标识/状态/进度，详情用 download_status，next_offset 续读，无网络。',
          schema(dict(state={'type':'string','enum':sorted(ACTIVE | {'completed','cancelled','interrupted'})},
                      offset={'type':'integer','minimum':0}, limit={'type':'integer','minimum':1,'maximum':100}, verbose=verbose), [])),
         ('download_control', download_control, 'cancel 保留部分文件且不关闭 SSH；resume 后台校验并手动续传。',
