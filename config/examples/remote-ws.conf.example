@@ -1,0 +1,13 @@
+# 全局选择示例；运行时不会读取本文件或 config/examples/。
+# 由用户复制为 ~/.config/remote-ws/remote-ws.conf，不覆盖已有真实配置，不创建或保留优化备份。
+# 配置目录须属当前用户且仅本人可访问（通常 0700）；文件须为本人普通文件，无符号链接且不可被组/他人写入。
+# 配置是 UTF-8 字面值 key=value，不执行 shell，不展开 ~、$USER 等变量。
+FORMAT_VERSION=3
+
+# 必须匹配 ssh_config 中的 Host srv-4090a（可写 4090a 或 srv-4090a）。
+# 工具显式 server > 项目 REMOTE_WS_SERVER > 此默认值。
+DEFAULT_SERVER=4090a
+
+# v3 不接受共享 roots 或 Conda 配置；每台服务器独立且仅在选中时读取。
+# 使用前必须提供完整的 servers.d/<服务器名>.conf；仅有 SSH 名录不代表已配置。
+# 未配置服务器不得继承其他服务器或旧版默认路径；v1/v2 仍兼容，但不自动迁移。

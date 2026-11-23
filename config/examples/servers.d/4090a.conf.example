@@ -1,0 +1,18 @@
+# v3 完整独立配置示例；运行时不会读取 *.example 或 config/examples/。
+# 由用户复制为 ~/.config/remote-ws/servers.d/4090a.conf 并替换占位值；不覆盖已有真实配置，不创建或保留优化备份。
+# servers.d 须属当前用户且不可被组/他人写入；文件须为本人普通文件，无符号链接且不可被组/他人写入。
+# 名称 4090a 必须精确匹配 ssh_config 的 Host srv-4090a，区分大小写。
+# 只在 remote-ws.conf 为 FORMAT_VERSION=3 且选择 4090a 时读取。
+# 仅允许以下四项；不要放版本、默认服务器或其他服务器配置。
+
+# 必须为该远端账号实际拥有的规范绝对路径；三个 ROOT 项不能为 / 或空值。
+# 每台服务器独立配置，不继承共享值、其他服务器或工具内置 roots。
+CODE_ROOT=/home/REPLACE_WITH_REMOTE_USER
+DATA_ROOT=/data/REPLACE_WITH_REMOTE_USER
+CONDA_ROOT=/home/REPLACE_WITH_REMOTE_USER/miniconda3
+
+# CONDA_INIT 必须显式设置；空值表示不使用额外初始化脚本。
+# 非空时必须是规范绝对路径；Conda 安装位置不扩大服务器写入授权根。
+CONDA_INIT=
+
+# 其他服务器只保留 SSH 名录，准备使用时另建完整独立配置；不复制真实账号凭据。

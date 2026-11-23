@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+/.kimi-code/
+/mcp/known_hosts*
+/mcp/ssh_config
+/mcp/remote-ws.conf
+/config/*
+!/config/examples/
+/downloads/
+/logs/
+*.bak
+*.part
+.env
+.env.*

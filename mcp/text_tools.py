@@ -1,0 +1,174 @@
+"""Bounded literal text search; helpers execute remotely only in memory."""
+import json
+import file_tools
+import local_connection
+import remote_common
+from remote_ws import config, transport
+
+REMOTE_SOURCE = remote_common.SOURCE + r'''
+import fnmatch, io, time
+a = json.load(sys.stdin)
+roots = a['roots']
+deadline = time.monotonic()+5
+used_bytes, entries_seen, matches, output_size = 0, 0, 0, 0
+skipped = dict(symlink=0, binary=0, oversized=0, unreadable=0, excluded=0)
+reason = None
+EXCLUDED = {'.git','__pycache__','.venv','venv','.jobs','data','datasets','checkpoints','weights'}
+
+def candidates(p):
+    global entries_seen, reason
+    if os.path.isfile(p):
+        yield p
+        return
+    stack = [p]
+    while stack:
+        folder = stack.pop()
+        fd = directory(folder)
+        try:
+            with os.scandir(fd) as items:
+                for entry in items:
+                    if time.monotonic() >= deadline or entries_seen >= 5000:
+                        reason = 'scan_limit'
+                        return
+                    entries_seen += 1
+                    s = entry.stat(follow_symlinks=False)
+                    path = folder+'/'+entry.name
+                    if stat.S_ISLNK(s.st_mode):
+                        skipped['symlink'] += 1
+                    elif s.st_uid != os.getuid():
+                        skipped['unreadable'] += 1
+                    elif stat.S_ISDIR(s.st_mode):
+                        if entry.name in EXCLUDED:
+                            skipped['excluded'] += 1
+                        else:
+                            stack.append(path)
+                    elif stat.S_ISREG(s.st_mode) and fnmatch.fnmatchcase(entry.name,a['file_glob']):
+                        yield path
+                    else:
+                        skipped['excluded'] += 1
+        finally:
+            os.close(fd)
+
+try:
+    root = guarded(a['path'])
+    results = []
+    query = a['query'] if a['case_sensitive'] else a['query'].casefold()
+    for candidate in candidates(root):
+        if reason:
+            break
+        if time.monotonic() >= deadline:
+            reason = 'time_limit'; break
+        parent, f = None, None
+        try:
+            p = guarded(candidate)
+            parent, f = opened(p)
+            s = os.fstat(f.fileno())
+            if s.st_uid != os.getuid():
+                skipped['unreadable'] += 1; continue
+            if s.st_size > 8*1024*1024:
+                skipped['oversized'] += 1; continue
+            if used_bytes+s.st_size > 32*1024*1024:
+                reason='byte_limit'; break
+            raw = f.read(8*1024*1024+1)
+            used_bytes += len(raw)
+            if len(raw)>8*1024*1024:
+                skipped['oversized'] += 1; continue
+            if b'\x00' in raw:
+                skipped['binary'] += 1; continue
+            try:
+                text=raw.decode('utf-8')
+            except UnicodeDecodeError:
+                skipped['binary'] += 1; continue
+            intervals=[];hit_lines=[]
+            for number,line in enumerate(io.StringIO(text),1):
+                if number%256 == 0 and time.monotonic()>=deadline:
+                    reason='time_limit'; break
+                if query in (line if a['case_sensitive'] else line.casefold()):
+                    if matches>=a['limit']:
+                        reason='match_limit'; break
+                    matches += 1
+                    hit_lines.append(number)
+                    start,end=max(1,number-a['context_lines']),number+a['context_lines']
+                    if intervals and start<=intervals[-1][1]+1:
+                        intervals[-1][1]=max(intervals[-1][1],end)
+                    else:
+                        intervals.append([start,end])
+            if not intervals:
+                continue
+            blocks=[];index=0
+            for number,line in enumerate(io.StringIO(text),1):
+                while index<len(intervals) and number>intervals[index][1]: index+=1
+                if index==len(intervals): break
+                if number>=intervals[index][0]:
+                    cost=len(json.dumps(line,ensure_ascii=False))
+                    if output_size+cost>a['max_chars']:
+                        reason='output_limit';break
+                    if len(blocks)<=index:
+                        blocks.append(dict(start_line=number,text=''))
+                    blocks[-1]['text']+=line
+                    output_size+=cost
+            if not same(f,p,parent,identity(s)):
+                raise ValueError('搜索期间文件发生变化，请重新搜索')
+            if hit_lines:
+                hit=dict(path=p,match_lines=hit_lines,blocks=blocks)
+                if a.get('include_sha256'):
+                    hit['sha256']=hashlib.sha256(raw).hexdigest() if s.st_size<=LIMIT else None
+                results.append(hit)
+        except (PermissionError, FileNotFoundError):
+            skipped['unreadable']+=1
+        finally:
+            if f: f.close()
+            if parent is not None: os.close(parent)
+        if reason: break
+    incomplete=bool(reason or skipped['oversized'] or skipped['unreadable'])
+    value=dict(ok=True,path=root,files=results,matches=matches)
+    if any(skipped.values()): value['skipped']=skipped
+    if incomplete:
+        value.update(incomplete=True,scanned_bytes=used_bytes,scanned_entries=entries_seen)
+        if reason: value['reason']=reason
+    emit(value)
+except Exception as error:
+    emit(dict(ok=False,error=str(error)))
+    sys.exit(1)
+'''
+
+def search_text(args, notes=()):
+    query=args.get('query')
+    pattern=args.get('file_glob','*')
+    notes=list(notes)
+    if 'file_glob' in args and pattern == '':
+        pattern='*'
+        notes.append("file_glob=\"\" 为空，已按 '*' 处理（未发送空模式）")
+    sensitive=args.get('case_sensitive',True)
+    if not isinstance(query,str) or not query or len(query)>256 or '\n' in query or '\x00' in query:
+        raise file_tools.FileToolError('query 必须是 1–256 字符的单行字面关键词')
+    if not isinstance(pattern,str) or not pattern or len(pattern)>128 or '/' in pattern or '\x00' in pattern:
+        raise file_tools.FileToolError('file_glob 必须是文件名通配符，如 *.py')
+    if type(sensitive) is not bool:
+        raise file_tools.FileToolError('case_sensitive 必须是布尔值')
+    include_sha256=args.get('include_sha256',False)
+    if type(include_sha256) is not bool:
+        raise file_tools.FileToolError('include_sha256 必须是布尔值')
+    max_chars,clamped=file_tools.clamped_integer(args,'max_chars',1800,256,12000)
+    if clamped:
+        notes.append('max_chars 超过 12000，已截为 12000')
+    limit, clamped = file_tools.clamped_integer(args, 'limit', 8, 1, 100)
+    if clamped:
+        notes.append('limit 超过 100，已截为 100')
+    context_lines, context_clamped = file_tools.clamped_integer(args, 'context_lines', 0, 0, 10)
+    if context_clamped:
+        notes.append('context_lines 超过 10，已截为 10')
+    context=config.resolve_context(args.get('server'))
+    server=context['SERVER']
+    roots=file_tools.roots_config(context=context)
+    payload=dict(operation='search',roots=roots,path=file_tools.request_path(args.get('path'),roots),
+                 query=query,file_glob=pattern,case_sensitive=sensitive,include_sha256=include_sha256,
+                 context_lines=context_lines,
+                 limit=limit,
+                 max_chars=max_chars)
+    value=transport.remote_json(server,payload,source=REMOTE_SOURCE)
+    value.pop('ok',None)
+    return file_tools.dump_value(value,notes,'搜索元数据过多，请缩小范围或 limit')
+
+def tools():
+    return []

@@ -1,0 +1,18 @@
+# SSH 名录占位示例；运行时不会读取本文件或 config/examples/。
+# 由用户复制为 ~/.config/remote-ws/ssh_config 后替换所需条目占位值；不改 ~/.ssh/config，不覆盖已有真实配置。
+# 不创建或保留优化备份；文件须属当前用户、无符号链接且不可被组/他人写入。
+# .invalid 是保留的示例域名，不是真实服务器；不得在此保存密码或私钥内容。
+# 仅明确列出的 srv-<名称> 注册为服务器；servers.d 文件本身不会注册服务器。
+# SSH 名录不提供 roots/Conda 配置；本模板仅配套 4090a 的完整独立配置示例。
+Host srv-4090a
+    HostName 4090a.example.invalid
+    User REPLACE_WITH_REMOTE_USER
+    Port 22
+
+# a100 仅保留名录占位；使用前须另建完整的 servers.d/a100.conf。
+Host srv-a100
+    HostName a100.example.invalid
+    User REPLACE_WITH_REMOTE_USER
+    Port 22
+
+# ControlPath、UserKnownHostsFile 和连接复用参数由工具/连接脚本指定。
